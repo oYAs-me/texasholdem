@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# agent markdown files
+*.md
+!README.md
+
+# save json files
+*.json
+
+# temp/log directory/files
+*.tmp
+*.temp
+*.log
+temp*/
+tmp*/
+logs/
