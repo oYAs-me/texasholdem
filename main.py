@@ -1,6 +1,2 @@
-def main():
-    print("Hello from texasholdem!")
+import random
 
-
-if __name__ == "__main__":
-    main()
