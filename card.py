@@ -94,7 +94,6 @@ class Hand:
     例: `repr(Hand((Card('s', 14), Card('s', 2))))` は `Hand((Card('s', 14), Card('s', 2)))` になる"""
     return f'Hand(({repr(self.cards[0])}, {repr(self.cards[1])}))' # これはソートせず生の順番で表現
   
-  @property
   def get_all_cards(self) -> set[Card]:
     """ハンドカードをsetで返す"""
     return set(self.cards)
@@ -139,7 +138,6 @@ class Board:
     river_repr = repr(self.river) if self.river else 'None'
     return f'Board(flops={flops_repr}, turn={turn_repr}, river={river_repr})'
   
-  @property
   def get_all_cards(self) -> set[Card]:
     """ボードカードをすべてsetで返す"""
     cards: set[Card] = set()
@@ -151,7 +149,6 @@ class Board:
       cards.add(self.river)
     return cards
   
-  @property
   def is_complete(self) -> bool:
     """ボードカードがすべてセットされているかどうかを返す"""
     if self.flops is None:
