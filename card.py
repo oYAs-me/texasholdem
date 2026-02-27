@@ -37,9 +37,19 @@ class Card:
     """Aは14、Kは13、Qは12、Jは11、Tは10、2-9はそのままの数値を返す"""
     return self._rank_int
 
+  def colored_str(self) -> str:
+    """スートに応じて色を付けた文字列を返す"""
+    from colorama import Fore, Style
+    color_map = {
+        's': Style.BRIGHT + Fore.WHITE, 
+        'h': Fore.RED,
+        'd': Fore.CYAN,
+        'c': Fore.GREEN
+    }
+    symbol_map = {'s': '♠', 'h': '♥', 'd': '♦', 'c': '♣'}
+    return f"{color_map[self._suit]}{symbol_map[self._suit]}{self.rank_str}{Style.RESET_ALL}"
+
   def __str__(self) -> str:
-    """Cardクラスのインスタンスを文字列に変換するためのメソッド\n
-    例: `str(Card('s', 2))` は `s2` になる"""
     return self.suit + self.rank_str
 
   def __repr__(self) -> str:
@@ -57,11 +67,10 @@ class Card:
 
   def __eq__(self, other) -> bool:
     """Cardクラスのインスタンス同士が等しいかどうかを比較するためのメソッド\n
-    スートに関係なく、ランクが同じなら等しいとみなす\n
-    例: `Card('s', 14) == Card('h', 14)` は `True` になる"""
+    スートとランクの両方が同じなら等しいとみなす"""
     if not isinstance(other, Card):
         return NotImplemented
-    return self.rank_int == other.rank_int
+    return self.rank_int == other.rank_int and self.suit == other.suit
   
   def __hash__(self) -> int:
     """Cardオブジェクトをハッシュ可能にするためのメソッド"""
