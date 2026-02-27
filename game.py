@@ -139,6 +139,8 @@ class Game:
             p = self.players[current_idx]
             if p.status == 'active':
                 call_amount = round_max_bet - p.round_bet
+                if p.name == "You":
+                    print(f"--- {p.name} の手番 (ポット: {self.pot}, 参加人数: {len(self.get_contesting_players())}, コール額: {call_amount}) ---")
                 valid_actions = ['fold']
                 if call_amount == 0:
                     valid_actions.append('check')
@@ -152,7 +154,7 @@ class Game:
                     'board': self.board,
                     'pot': self.pot,
                     'call_amount': call_amount,
-                    'min_raise': call_amount + self.big_blind,
+                    'min_raise': round_max_bet + self.big_blind,
                     'players': [{'name': p_other.name, 'chips': p_other.chips, 'status': p_other.status} for p_other in self.players]
                 }
                 
@@ -176,7 +178,9 @@ class Game:
                     p.round_bet += pay_amt
                     self.pot += pay_amt
                 elif action == 'raise':
-                    pay_amt = p.pay(amount - p.round_bet)
+                    # レイズ額が現在の最大ベットより小さい場合は修正する
+                    actual_raise_to = max(amount, round_max_bet + self.big_blind)
+                    pay_amt = p.pay(actual_raise_to - p.round_bet)
                     p.round_bet += pay_amt
                     self.pot += pay_amt
                     round_max_bet = p.round_bet
@@ -220,18 +224,55 @@ class Game:
         for p in contesting:
             if p.hand:
                 ev_hand = evaluate_hand(p.hand, self.board)
-                evaluated_hands.append((ev_hand, p))
+                evaluated_hands.append({'ev': ev_hand, 'player': p})
                 secondary_rank_str = f", {ev_hand.secondary_rank}" if ev_hand.secondary_rank else ""
                 print(f"{p.name}: {p.hand_output_format(p.hand.cards)} -> {ev_hand.hand_type}({ev_hand.primary_rank}{secondary_rank_str})")
 
-        evaluated_hands.sort(key=lambda x: x[0].value, reverse=True)
-        best_value = evaluated_hands[0][0].value
-        winners = [p for ev, p in evaluated_hands if ev.value == best_value]
+        # 役の強さでソート（降順）
+        evaluated_hands.sort(key=lambda x: x['ev'].value, reverse=True)
 
-        win_amount = self.pot // len(winners)
-        for w in winners:
-            print(f"{w.name} がポット {win_amount} を獲得しました！")
-            w.receive_winnings(win_amount)
+        # 各プレイヤーがこのハンドでポットに入れた総額（サイドポット計算用）
+        # フォールドしたプレイヤーの拠出金もポットに含まれているため保持しておく
+        contributions = {p: p.current_bet for p in self.players}
+        
+        while self.pot > 0:
+            # まだ取り分がある（拠出金が残っている）勝者を特定
+            best_val = -1
+            winners = []
+            for item in evaluated_hands:
+                p = item['player']
+                if contributions[p] > 0:
+                    if best_val == -1:
+                        best_val = item['ev'].value
+                        winners.append(p)
+                    elif item['ev'].value == best_val:
+                        winners.append(p)
+            
+            if not winners:
+                # 役のある勝者が誰もいない場合（通常ありえないが安全のため）
+                break
+
+            # この勝者たちが現在のサイドポットから獲得できる「一人あたりの最大額」
+            # 勝者の中で最も拠出額（の残り）が少ないプレイヤーの額が上限になる
+            max_per_winner = min(contributions[w] for w in winners)
+            
+            # 全プレイヤー（フォールドした人も含む）から、max_per_winner 以下の分をポットから集める
+            total_winnable = 0
+            for p in self.players:
+                can_take = min(contributions[p], max_per_winner)
+                total_winnable += can_take
+                contributions[p] -= can_take
+                self.pot -= can_take
+            
+            # 勝者で分配
+            share = total_winnable // len(winners)
+            for w in winners:
+                print(f"{w.name} がポット {share} を獲得しました！")
+                w.receive_winnings(share)
+            
+            # 端数は最初の勝者に
+            if total_winnable % len(winners) != 0:
+                winners[0].receive_winnings(total_winnable % len(winners))
 
         self.move_dealer()
 
