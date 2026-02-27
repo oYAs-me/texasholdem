@@ -27,6 +27,9 @@ class SimpleMCCFR:
 
     # この訪問回数を超えたら CFR 戦略を使う（それ以下はヒューリスティック）
     _LEARN_THRESHOLD = 20
+    # この訪問回数を超えたら平均戦略（strategy_sum）でプレイする
+    # CFR 理論では「現在の戦略」ではなく「全イテレーションの平均戦略」がナッシュ均衡に収束する
+    _AVG_STRATEGY_THRESHOLD = 100
 
     def __init__(self) -> None:
         # {state_key: {action: 累積後悔}}
@@ -55,21 +58,28 @@ class SimpleMCCFR:
         if self.visit_count[state_key] < self._LEARN_THRESHOLD:
             return heuristic_strategy(eq_bucket, valid_actions)
 
-        # Regret Matching: 正の後悔のみを使用して確率を計算
+        # Regret Matching: 正の後悔のみを使用して現在戦略を計算
         regrets = self.regret_sum[state_key]
         positive = {a: max(regrets.get(a, 0.0), 0.0) for a in valid_actions}
         total = sum(positive.values())
 
         if total > 0:
-            strategy = {a: positive[a] / total for a in valid_actions}
+            current_strategy = {a: positive[a] / total for a in valid_actions}
         else:
-            strategy = heuristic_strategy(eq_bucket, valid_actions)
+            current_strategy = heuristic_strategy(eq_bucket, valid_actions)
 
         # 平均戦略の累積（収束後に average strategy を使えるようにする）
         for a in valid_actions:
-            self.strategy_sum[state_key][a] += strategy[a]
+            self.strategy_sum[state_key][a] += current_strategy[a]
 
-        return strategy
+        # 十分学習された状態では平均戦略でプレイ（CFR 理論上の均衡戦略）
+        if self.visit_count[state_key] >= self._AVG_STRATEGY_THRESHOLD:
+            avg = self.strategy_sum[state_key]
+            avg_total = sum(avg.get(a, 0.0) for a in valid_actions)
+            if avg_total > 0:
+                return {a: avg.get(a, 0.0) / avg_total for a in valid_actions}
+
+        return current_strategy
 
     # ──────────────────────────────────────────────
     # 学習（後悔の更新）
@@ -91,6 +101,9 @@ class SimpleMCCFR:
         taken_value = action_values.get(taken_action, 0.0)
         for action, value in action_values.items():
             self.regret_sum[state_key][action] += value - taken_value
+            # CFR+: 負の累積後悔を 0 にリセット（収束速度を向上）
+            if self.regret_sum[state_key][action] < 0:
+                self.regret_sum[state_key][action] = 0.0
 
     # ──────────────────────────────────────────────
     # 永続化

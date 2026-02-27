@@ -125,6 +125,15 @@ class Game:
                 
         last_raiser = -1
         current_idx = start_idx
+
+        # 現在のベッティングラウンドで最後にアクションするプレイヤーを特定
+        _scan = start_idx
+        _last_active_name = ''
+        for _ in range(len(self.players)):
+            if self.players[_scan].status == 'active':
+                _last_active_name = self.players[_scan].name
+            _scan = (_scan + 1) % len(self.players)
+        last_to_act_name = _last_active_name
         
         # BBのポジションを特定（プリフロップの終了判定用）
         bb_pos = -1
@@ -146,7 +155,8 @@ class Game:
                 game_state = {
                     'board': self.board, 'pot': self.pot, 'call_amount': call_amount,
                     'min_raise': round_max_bet + self.big_blind,
-                    'players': [{'name': p_o.name, 'chips': p_o.chips, 'status': p_o.status} for p_o in self.players]
+                    'players': [{'name': p_o.name, 'chips': p_o.chips, 'status': p_o.status} for p_o in self.players],
+                    'last_to_act_name': last_to_act_name,
                 }
                 
                 # アクション取得

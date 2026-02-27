@@ -62,12 +62,23 @@ def _run_chunk(args: tuple) -> dict:
         with contextlib.redirect_stdout(io.StringIO()):
             game.play_round()
 
-    # CFR データを辞書として返す（pickle 可能な形式）
-    cfr = players[0].cfr
+    # 全プレイヤーの CFR データをマージして返す（対称的な自己対戦なので合算可能）
+    merged_regret:   dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    merged_strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    merged_visits:   dict[str, int] = defaultdict(int)
+    for p in players:
+        for k, v in p.cfr.regret_sum.items():
+            for a, val in v.items():
+                merged_regret[k][a] += val
+        for k, v in p.cfr.strategy_sum.items():
+            for a, val in v.items():
+                merged_strategy[k][a] += val
+        for k, val in p.cfr.visit_count.items():
+            merged_visits[k] += val
     return {
-        "regret_sum":   {k: dict(v) for k, v in cfr.regret_sum.items()},
-        "strategy_sum": {k: dict(v) for k, v in cfr.strategy_sum.items()},
-        "visit_count":  dict(cfr.visit_count),
+        "regret_sum":   {k: dict(v) for k, v in merged_regret.items()},
+        "strategy_sum": {k: dict(v) for k, v in merged_strategy.items()},
+        "visit_count":  dict(merged_visits),
     }
 
 
