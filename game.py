@@ -72,7 +72,20 @@ class Game:
             
         # プリフロップ
         print(f"\n{Fore.BLUE}[プリフロップ]{Style.RESET_ALL}")
-        start_idx = (self.dealer_pos + 3) % len(self.players)
+        
+        # BBの位置を特定
+        sb_pos = (self.dealer_pos + 1) % len(self.players)
+        while self.players[sb_pos].status == 'busted':
+            sb_pos = (sb_pos + 1) % len(self.players)
+        bb_pos = (sb_pos + 1) % len(self.players)
+        while self.players[bb_pos].status == 'busted':
+            bb_pos = (bb_pos + 1) % len(self.players)
+            
+        # BBの次から開始
+        start_idx = (bb_pos + 1) % len(self.players)
+        while self.players[start_idx].status == 'busted':
+            start_idx = (start_idx + 1) % len(self.players)
+            
         if not self.betting_round(start_idx):
             self.end_round_early()
             return True
@@ -87,7 +100,12 @@ class Game:
             elif name == "リバー": self.board.set_river(cards[0])
             
             print(f"ボード: [{Player.hand_output_format(self.board.get_all_cards())}]")
+            
+            # ディーラーの次（SBの位置）から開始
             start_idx = (self.dealer_pos + 1) % len(self.players)
+            while self.players[start_idx].status == 'busted':
+                start_idx = (start_idx + 1) % len(self.players)
+                
             if not self.betting_round(start_idx):
                 self.end_round_early()
                 return True
@@ -98,12 +116,23 @@ class Game:
     def betting_round(self, start_idx: int) -> bool:
         for p in self.players: p.round_bet = 0
         round_max_bet = 0
-        if self.current_bet > 0 and len(self.board.get_all_cards()) == 0:
+        
+        # プリフロップ（ボードにカードがない）かつベットがある場合
+        is_preflop = (len(self.board.get_all_cards()) == 0)
+        if is_preflop and self.current_bet > 0:
             round_max_bet = self.big_blind
             for p in self.players: p.round_bet = p.current_bet
                 
         last_raiser = -1
         current_idx = start_idx
+        
+        # BBのポジションを特定（プリフロップの終了判定用）
+        bb_pos = -1
+        if is_preflop:
+            sb_p = (self.dealer_pos + 1) % len(self.players)
+            while self.players[sb_p].status == 'busted': sb_p = (sb_p + 1) % len(self.players)
+            bb_pos = (sb_p + 1) % len(self.players)
+            while self.players[bb_pos].status == 'busted': bb_pos = (bb_pos + 1) % len(self.players)
         
         while True:
             p = self.players[current_idx]
@@ -150,13 +179,21 @@ class Game:
             
             if len(self.get_contesting_players()) == 1: return False
             next_idx = (current_idx + 1) % len(self.players)
+            
+            # 全員がフォールドまたはオールインでアクティブなプレイヤーがいない場合
             if len([p for p in self.players if p.status == 'active']) == 0: break
-            if next_idx == last_raiser: break
-            if last_raiser == -1 and next_idx == start_idx:
-                if self.current_bet > 0 and len(self.board.get_all_cards()) == 0:
-                    bb_pos = (self.dealer_pos + 2) % len(self.players)
+            
+            # レイズがあった場合、レイザーの右隣まで回ったら終了
+            if last_raiser != -1:
+                if next_idx == last_raiser: break
+            else:
+                # レイズがない場合、開始位置まで戻ったら終了
+                # ただしプリフロップではBBが最後にオプションを持つ
+                if is_preflop:
                     if current_idx == bb_pos: break
-                else: break
+                elif next_idx == start_idx:
+                    break
+                    
             current_idx = next_idx
         return True
 

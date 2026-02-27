@@ -10,26 +10,6 @@ uv run python main.py
 
 キー操作: `c` = check/call、`f` = fold、`r`/`b` = raise/bet
 
-## GTO CPU の事前学習
-
-ゲーム開始前に自己対戦で戦略を学習させる。学習結果は `gto_strategy.json` に保存され、次回起動時に引き継がれる。
-
-```bash
-# 基本（1000 ハンド / 4 人テーブル）
-uv run python gto_selfplay.py
-
-# 本格学習
-uv run python gto_selfplay.py --hands 5000 --players 6
-
-# 高速モード（精度を下げてスループット重視）
-uv run python gto_selfplay.py --hands 10000 --sims 50
-
-# オプション一覧
-uv run python gto_selfplay.py --help
-```
-
-`main.py` でのプレイ中も自動的に事後学習が行われ、`gto_strategy.json` が更新され続ける。
-
 ## ファイル構成
 
 | ファイル | 役割 |
@@ -60,3 +40,23 @@ uv run python -m unittest test_game.py -v
 | `BalancedCpu` | エクイティとポットオッズのバランスで判断 |
 | `AggressiveCpu` | 一定確率でブラフ込みのアグレッシブな行動 |
 | `GtoCpu` | Regret Matching による混合戦略。プレイを重ねるほど洗練される |
+
+## GTO CPU の事前学習
+
+ゲーム開始前に自己対戦で戦略を学習させる。学習結果は `gto_strategy.json` に保存され、次回起動時に引き継がれる。`main.py` でのプレイ中も自動的に事後学習が行われ、蓄積され続ける。
+
+```bash
+uv run python gto_selfplay.py
+
+# オプション一覧
+uv run python gto_selfplay.py --help
+```
+
+| オプション | デフォルト | 説明 |
+|-----------|-----------|------|
+| `--hands N` | 1000 | 学習ハンド数（`--minutes` と同時指定不可） |
+| `--minutes M` | — | 学習時間（分）。終了時に自動保存 |
+| `--players N` | 4 | テーブル人数（2〜6） |
+| `--workers N` | CPU コア数 | 並列ワーカー数 |
+| `--sims N` | 200 | Monte Carlo 試行数（少ないほど高速・精度低） |
+| `--save PATH` | `gto_strategy.json` | 保存先 |

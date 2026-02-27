@@ -147,15 +147,15 @@ class Board:
     river_repr = repr(self.river) if self.river else 'None'
     return f'Board(flops={flops_repr}, turn={turn_repr}, river={river_repr})'
   
-  def get_all_cards(self) -> set[Card]:
-    """ボードカードをすべてsetで返す"""
-    cards: set[Card] = set()
+  def get_all_cards(self) -> list[Card]:
+    """ボードカードをすべてlistで返す（順序を維持する）"""
+    cards: list[Card] = []
     if self.flops:
-      cards.update(self.flops)
+      cards.extend(self.flops)
     if self.turn:
-      cards.add(self.turn)
+      cards.append(self.turn)
     if self.river:
-      cards.add(self.river)
+      cards.append(self.river)
     return cards
   
   def is_complete(self) -> bool:
