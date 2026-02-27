@@ -20,3 +20,7 @@ wheels/
 temp*/
 tmp*/
 logs/
+
+# GTO 学習データ（生成ファイル・毎ゲーム更新される）
+# 事前学習済みバージョンを配布したい場合は GitHub Releases を使用
+gto_strategy.json

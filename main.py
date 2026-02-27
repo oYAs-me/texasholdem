@@ -1,5 +1,6 @@
 from player import HumanPlayer, ConservativeCpu, BalancedCpu, AggressiveCpu
-from game import Game
+from gto_cpu import GtoCpu
+from learning_game import LearningGame as Game
 
 def main():
     print("=== テキサスホールデム CLI ===")
@@ -12,6 +13,7 @@ def main():
     players.append(AggressiveCpu("CPU-3", chips=1000))
     players.append(BalancedCpu("CPU-4", chips=1000))
     players.append(AggressiveCpu("CPU-5", chips=1000))
+    players.append(GtoCpu("GTO-CPU", chips=1000))
         
     game = Game(players, start_chips=1000, sb=10, bb=20)
     

@@ -1,21 +1,62 @@
 # Texas Hold'em Poker Game Implementation in Python
 
-en) This repository contains a Python implementation of a Texas Hold'em Poker game. The game allows players to play against each other or against a computer opponent. The implementation includes the basic rules of Texas Hold'em, such as betting rounds, hand rankings, and determining the winner.
+PythonによるテキサスホールデムポーカーのCLI実装。ルールベースの対戦AIに加え、**GTO（Game Theory Optimal）CPU** を搭載。Regret Matching による混合戦略と事前学習・事後学習に対応している。
 
-ja) このリポジトリには、テキサスホールデムポーカーゲームのPython実装が含まれています。プレイヤーは互いに対戦したり、コンピュータの対戦相手と対戦したりすることができます。実装には、テキサスホールデムの基本的なルールが含まれており、ベッティングラウンド、ハンドランキング、および勝者の決定などが含まれています。
+## 起動方法
 
-## 実装に際して最初に取り組むこと
+```bash
+uv run python main.py
+```
 
-- [x] 手札やコミュニティカードのクラスの設計と実装
-- [x] 各手札とコミュニティカードでの役の判定ロジックの実装
-- [x] シミュレーションのためのランダムなカードの生成と配布ロジックの実装
-  - [x] カードのデッキの作成とシャッフルロジックの実装
-  - [x] プレイヤーへのカードの配布ロジックの実装
-  - [x] コミュニティカードの配布ロジックの実装
-  - [ ] 確率計算を行えるシステムの設計と実装
-- [x] ベッティングシステムの設計と実装
-- [x] プレイヤーのインターフェースの設計と実装
-- [x] ゲームの進行管理と勝者の判定ロジックの実装
-- [x] コンピュータ対戦相手のAIロジックの設計と実装
-- [x] ゲームのテストケースの作成と実行
-- [x] ユーザーインターフェースの設計と実装（コマンドラインまたはGUI）
+キー操作: `c` = check/call、`f` = fold、`r`/`b` = raise/bet
+
+## GTO CPU の事前学習
+
+ゲーム開始前に自己対戦で戦略を学習させる。学習結果は `gto_strategy.json` に保存され、次回起動時に引き継がれる。
+
+```bash
+# 基本（1000 ハンド / 4 人テーブル）
+uv run python gto_selfplay.py
+
+# 本格学習
+uv run python gto_selfplay.py --hands 5000 --players 6
+
+# 高速モード（精度を下げてスループット重視）
+uv run python gto_selfplay.py --hands 10000 --sims 50
+
+# オプション一覧
+uv run python gto_selfplay.py --help
+```
+
+`main.py` でのプレイ中も自動的に事後学習が行われ、`gto_strategy.json` が更新され続ける。
+
+## ファイル構成
+
+| ファイル | 役割 |
+|---------|------|
+| `card.py` | `Card` / `Hand` / `Board` クラス、デッキ生成 |
+| `hand_strength.py` | 役判定（`evaluate_hand`）、`EvaluatedHand` |
+| `probability.py` | エクイティ計算（Monte Carlo）、ハンド分布計算 |
+| `player.py` | `Player` 基底クラス、`HumanPlayer`、ルールベース CPU 3種 |
+| `game.py` | ゲーム進行、ベッティングラウンド、ショーダウン |
+| `learning_game.py` | `Game` サブクラス。ラウンド後に `on_round_end` フックを呼ぶ |
+| `gto_strategy.py` | ゲーム状態の抽象化、ヒューリスティック初期戦略テーブル |
+| `gto_cfr.py` | Regret Matching エンジン（SimpleMCCFR）、JSON 永続化 |
+| `gto_cpu.py` | `GtoCpu` クラス。混合戦略による意思決定、GTO ベットサイジング |
+| `gto_selfplay.py` | 事前学習 CLI スクリプト |
+| `precompute_preflop.py` | プリフロップ分布の事前計算（`preflop_distributions.json` を生成） |
+
+## テスト
+
+```bash
+uv run python -m unittest test_game.py -v
+```
+
+## CPU の種類
+
+| クラス | 特徴 |
+|-------|------|
+| `ConservativeCpu` | エクイティが高い時だけベット。保守的 |
+| `BalancedCpu` | エクイティとポットオッズのバランスで判断 |
+| `AggressiveCpu` | 一定確率でブラフ込みのアグレッシブな行動 |
+| `GtoCpu` | Regret Matching による混合戦略。プレイを重ねるほど洗練される |
