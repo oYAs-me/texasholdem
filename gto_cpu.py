@@ -31,6 +31,7 @@ _RAISE_RATIOS: dict[str, float] = {
     'raise_33':  0.33,
     'raise_67':  0.67,
     'raise_100': 1.00,
+    'raise_200': 2.00,
 }
 _RAISE_SIZES = list(_RAISE_RATIOS.keys())
 
@@ -117,13 +118,12 @@ class GtoCpu(CpuAgent):
         eq_bucket = get_equity_bucket(equity)
         is_last_to_act: bool = (game_state.get('last_to_act_name', '') == self.name)
 
-        # フロップ/ターンのみ: 現在の手役が弱い（ドロー）か強い（完成手）かを判定
-        # リバーはドローが存在しないため 'na'、プリフロップも 'na'
+        # ── ハンド・ポテンシャル詳細分類 ──
         hand_potential = 'na'
-        street = get_street(board)
-        if street in ('flop', 'turn') and self.hand is not None:
+        if self.hand is not None:
+            from gto_strategy import get_hand_potential
             ev = evaluate_hand(self.hand, board)
-            hand_potential = 'draw' if ev.hand_type in ('HIGH_CARD', 'ONE_PAIR') else 'made'
+            hand_potential = get_hand_potential(ev.hand_type, self.hand, board)
 
         state_key = build_state_key(
             equity, board, call_amount, pot, num_opponents,

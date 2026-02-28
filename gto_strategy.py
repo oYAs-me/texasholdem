@@ -1,97 +1,91 @@
 """
 gto_strategy.py
 
-ゲーム状態の抽象化と、GTOヒューリスティック初期戦略テーブル。
-CFR学習前でも合理的な混合戦略を提供する。
+GTO 戦略のための状態抽象化とヒューリスティック。
+状態空間（バケット）を細分化し、より高度な意思決定を可能にする。
 """
 from __future__ import annotations
-from collections import Counter
+from typing import Any
 from card import Board
-
+from hand_strength import evaluate_hand, EvaluatedHand
 
 # ──────────────────────────────────────────────
-# ゲーム状態の抽象化
+# 状態の抽象化 (Bucketing)
 # ──────────────────────────────────────────────
-
-def get_street(board: Board) -> str:
-    if board.flops is None:
-        return 'preflop'
-    if board.turn is None:
-        return 'flop'
-    if board.river is None:
-        return 'turn'
-    return 'river'
-
-
-def classify_board_texture(board: Board) -> str:
-    """ボードのテクスチャを dry / semi_wet / wet に分類"""
-    if board.flops is None:
-        return 'dry'
-
-    cards = list(board.flops)
-    if board.turn:
-        cards.append(board.turn)
-    if board.river:
-        cards.append(board.river)
-
-    suits = [c.suit for c in cards]
-    rank_set = {c.rank_int for c in cards}
-    # A-5 Wheel: Ace を 1（ローエース）としても扱う
-    if 14 in rank_set:
-        rank_set.add(1)
-    ranks = sorted(rank_set, reverse=True)
-
-    max_suit_count = max(Counter(suits).values())
-
-    # 連続ランクの最大長を計算
-    max_consecutive = current = 1
-    for i in range(len(ranks) - 1):
-        if ranks[i] - ranks[i + 1] == 1:
-            current += 1
-            max_consecutive = max(max_consecutive, current)
-        else:
-            current = 1
-
-    if max_suit_count >= 3 or max_consecutive >= 3:
-        return 'wet'
-    if max_suit_count == 2 or max_consecutive == 2:
-        return 'semi_wet'
-    return 'dry'
-
 
 def get_equity_bucket(equity: float) -> int:
-    """エクイティを 0〜7 の 8 段階バケットに変換（0: <12.5%, 7: >87.5%）"""
-    return min(int(equity * 8), 7)
+    """エクイティを 0-19 の 20 段階に分類 (5% 刻み)"""
+    return min(int(equity * 20), 19)
 
+def get_street(board: Board) -> str:
+    all_cards = board.get_all_cards()
+    n = len(all_cards)
+    if n == 0: return 'preflop'
+    if n == 3: return 'flop'
+    if n == 4: return 'turn'
+    return 'river'
 
-def get_pot_odds_bucket(call_amount: int, pot: int) -> int:
-    """ポットオッズを 0〜4 の 5 段階に変換。
-    bucket 0 は call_amount==0（チェック可能）の専用バケット。
-    コールが必要な場合は 1〜4 に割り当て、check状況と混同しない。
+def classify_board_texture(board: Board) -> str:
     """
-    if call_amount == 0:
-        return 0  # check専用
-    total = pot + call_amount
-    if total == 0:
-        return 1
-    return min(max(int(call_amount / total * 5), 1), 4)
-
-
-def get_spr_bucket(chips: int, pot: int) -> int:
-    """SPR (Stack-to-Pot Ratio) を 0〜2 の 3 段階に変換
-    0: <1 (ショートスタック・コミット済み)
-    1: 1〜4 (ミディアム)
-    2: >4  (ディープスタック)
+    ボードのテクスチャを分類する（レア状態のサンプリング用）。
+    分類例: monotone, flush_draw, rainbow, paired, trips
     """
-    if pot <= 0:
-        return 2
-    spr = chips / pot
-    if spr < 1:
-        return 0
-    if spr < 4:
-        return 1
-    return 2
+    cards = board.get_all_cards()
+    if not cards: return 'na'
+    
+    suits = [c.suit for c in cards]
+    ranks = [c.rank_int for c in cards]
+    suit_counts = {s: suits.count(s) for s in set(suits)}
+    rank_counts = {r: ranks.count(r) for r in set(ranks)}
+    
+    max_suit = max(suit_counts.values()) if suit_counts else 0
+    max_rank = max(rank_counts.values()) if rank_counts else 0
+    
+    if max_rank >= 3: return 'trips'
+    if max_rank == 2: return 'paired'
+    if max_suit >= 3: return 'monotone'
+    if max_suit == 2: return 'flush_draw'
+    return 'rainbow'
 
+def get_hand_potential(hand_type: str, hand: Any, board: Board) -> str:
+    """
+    ハンドの強さと発展性を詳細に分類する。
+    分類: nuts, strong, mid, weak_made, strong_draw, weak_draw, nothing
+    """
+    street = get_street(board)
+    if street == 'preflop':
+        return 'na'
+    
+    # 役の種類による基本分類
+    if hand_type in ('STRAIGHT_FLUSH', 'FOUR_OF_A_KIND', 'FULL_HOUSE'):
+        return 'nuts'
+    if hand_type in ('FLUSH', 'STRAIGHT', 'THREE_OF_A_KIND'):
+        return 'strong'
+    if hand_type == 'TWO_PAIR':
+        return 'mid'
+    
+    # ワンペアの場合の判定
+    if hand_type == 'ONE_PAIR':
+        # ボードの最大ランクと比較してトップペア以上か判定（簡易的）
+        board_cards = board.get_all_cards()
+        max_board_rank = max([c.rank_int for c in board_cards]) if board_cards else 0
+        # 手札のペアのランクを取得
+        from collections import Counter
+        all_ranks = [c.rank_int for c in list(hand.cards) + list(board_cards)]
+        counts = Counter(all_ranks)
+        pair_rank = max([r for r, c in counts.items() if c >= 2])
+        
+        if pair_rank >= max_board_rank:
+            return 'mid'  # トップペア以上
+        return 'weak_made' # ミドル・ボトムペア
+    
+    # ハイカードの場合（ドローの判定）
+    if street == 'river':
+        return 'nothing' # リバーでハイカードは「無」
+        
+    # ドロー判定 (簡易実装: 本来は card.py 等で判定すべきだが、ここではエクイティと組み合わせて機能させる)
+    # 実際には equity が高いハイカード = 強いドローとして機能する
+    return 'draw' # 後続の処理で equity に応じて判断されるため、ここでは draw に統一
 
 def build_state_key(
     equity: float,
@@ -101,71 +95,92 @@ def build_state_key(
     num_opponents: int,
     is_last_to_act: bool = False,
     chips: int = 1000,
-    hand_potential: str = 'na',
+    hand_potential: str = 'na'
 ) -> str:
-    """CFR のルックアップキーを生成する"""
+    """
+    CFR 用の状態キー（InfoSet）を作成する。
+    """
     street = get_street(board)
-    eq_bucket = get_equity_bucket(equity)
     texture = classify_board_texture(board)
-    po_bucket = get_pot_odds_bucket(call_amount, pot)
-    opp_count = min(num_opponents, 4)
-    pos = 'IP' if is_last_to_act else 'OOP'
-    spr_bucket = get_spr_bucket(chips, pot)
-    return f"{street}:{eq_bucket}:{texture}:{po_bucket}:{opp_count}:{pos}:{spr_bucket}:{hand_potential}"
+    
+    # ポットに対するコールの重み (0: check可, 1: 小, 2: 中, 3: 大)
+    pot_ratio = 0
+    if pot > 0:
+        ratio = call_amount / pot
+        if ratio == 0: pot_ratio = 0
+        elif ratio <= 0.35: pot_ratio = 1
+        elif ratio <= 0.75: pot_ratio = 2
+        else: pot_ratio = 3
+    
+    # スタックの深さ (0: ショート, 1: 通常, 2: ディープ)
+    stack_depth = 1
+    if pot > 0:
+        eff_stack = chips / pot
+        if eff_stack < 3: stack_depth = 0
+        elif eff_stack > 15: stack_depth = 2
 
+    # 対戦人数 (1: heads-up, 2: multi-way)
+    opp_count = 1 if num_opponents == 1 else 2
+
+    # キーの組み立て
+    # 例: "flop_paired_p2_s1_o2_pos1_mid"
+    return f"{street}_{texture}_p{pot_ratio}_s{stack_depth}_o{opp_count}_pos{int(is_last_to_act)}_{hand_potential}"
 
 # ──────────────────────────────────────────────
-# ヒューリスティック初期戦略テーブル（GTOの近似）
+# ヒューリスティック戦略 (CFR の初期値・フォールバック)
 # ──────────────────────────────────────────────
-#
-# GTO の原則:
-#   - 強い手はバリューベット + 一定割合チェック（チェックレイズ用）
-#   - 弱い手もブラフ頻度を維持（相手に自由なチェックを与えない）
-#   - コール頻度はポットオッズで均衡させる（相手のブラフを無効化）
-#   - 非常に弱い手（eq_bucket 0）もブラフとして一定確率でレイズ
-#
-# equity bucket 対応:
-#   7: >87.5%   6: 75-87%   5: 62-75%   4: 50-62%
-#   3: 37-50%   2: 25-37%   1: 12-25%   0: <12.5%
-
-# ベット/チェック状況（call_amount == 0）
-# raise_33 / raise_67 / raise_100 = ポットの 33% / 67% / 100% ベット
-_BET_STRAT: dict[int, dict[str, float]] = {
-    7: {'raise_33': 0.10, 'raise_67': 0.35, 'raise_100': 0.37, 'check': 0.18},  # ナッツ: 大きめ＋チェックレイズ準備
-    6: {'raise_33': 0.15, 'raise_67': 0.35, 'raise_100': 0.20, 'check': 0.30},
-    5: {'raise_33': 0.20, 'raise_67': 0.20, 'raise_100': 0.10, 'check': 0.50},
-    4: {'raise_33': 0.20, 'raise_67': 0.07, 'raise_100': 0.03, 'check': 0.70},
-    3: {'raise_33': 0.15, 'raise_67': 0.03, 'raise_100': 0.00, 'check': 0.82},  # セミブラフ: 小さめ
-    2: {'raise_33': 0.10, 'raise_67': 0.02, 'raise_100': 0.00, 'check': 0.88},
-    1: {'raise_33': 0.05, 'raise_67': 0.01, 'raise_100': 0.00, 'check': 0.94},
-    0: {'raise_33': 0.12, 'raise_67': 0.02, 'raise_100': 0.00, 'check': 0.86},  # 弱手ブラフ: 小さめ
-}
-
-# コール/フォールド/レイズ状況（call_amount > 0）
-_CALL_STRAT: dict[int, dict[str, float]] = {
-    7: {'raise_33': 0.05, 'raise_67': 0.25, 'raise_100': 0.42, 'call': 0.28, 'fold': 0.00},
-    6: {'raise_33': 0.10, 'raise_67': 0.20, 'raise_100': 0.12, 'call': 0.55, 'fold': 0.03},
-    5: {'raise_33': 0.08, 'raise_67': 0.05, 'raise_100': 0.01, 'call': 0.80, 'fold': 0.06},
-    4: {'raise_33': 0.03, 'raise_67': 0.01, 'raise_100': 0.00, 'call': 0.66, 'fold': 0.30},
-    3: {'raise_33': 0.00, 'raise_67': 0.00, 'raise_100': 0.00, 'call': 0.42, 'fold': 0.58},
-    2: {'raise_33': 0.00, 'raise_67': 0.00, 'raise_100': 0.00, 'call': 0.18, 'fold': 0.82},
-    1: {'raise_33': 0.00, 'raise_67': 0.00, 'raise_100': 0.00, 'call': 0.07, 'fold': 0.93},
-    0: {'raise_33': 0.00, 'raise_67': 0.00, 'raise_100': 0.00, 'call': 0.04, 'fold': 0.96},
-}
-
 
 def heuristic_strategy(eq_bucket: int, valid_actions: list[str]) -> dict[str, float]:
     """
-    有効アクションに合わせた初期ヒューリスティック戦略を返す。
-    CFR 未学習状態でのフォールバックとして使用する。
+    エクイティに基づいた初期戦略を生成する。
+    eq_bucket: 0-19 (5%刻み)
     """
-    facing_bet = 'call' in valid_actions
-    base = (_CALL_STRAT if facing_bet else _BET_STRAT)[eq_bucket].copy()
+    strategy = {a: 0.0 for a in valid_actions}
+    equity = (eq_bucket + 0.5) / 20.0  # 中央値で計算
+    
+    # 非常に強い手 (Equity > 85%)
+    if equity > 0.85:
+        if 'raise_200' in valid_actions: strategy['raise_200'] = 0.2
+        if 'raise_100' in valid_actions: strategy['raise_100'] = 0.3
+        if 'raise_67' in valid_actions: strategy['raise_67'] = 0.2
+        if 'raise_33' in valid_actions: strategy['raise_33'] = 0.1
+        if 'call' in valid_actions: strategy['call'] = 0.2
+        if 'check' in valid_actions: strategy['check'] = 0.2
+    
+    # 強い手 (Equity 70-85%)
+    elif equity > 0.7:
+        if 'raise_100' in valid_actions: strategy['raise_100'] = 0.2
+        if 'raise_67' in valid_actions: strategy['raise_67'] = 0.3
+        if 'raise_33' in valid_actions: strategy['raise_33'] = 0.2
+        if 'call' in valid_actions: strategy['call'] = 0.2
+        if 'check' in valid_actions: strategy['check'] = 0.3
+    
+    # 中堅の手 (Equity 45-70%)
+    elif equity > 0.45:
+        if 'raise_33' in valid_actions: strategy['raise_33'] = 0.1
+        if 'call' in valid_actions: strategy['call'] = 0.6
+        if 'check' in valid_actions: strategy['check'] = 0.7
+        if 'fold' in valid_actions: strategy['fold'] = 0.1
+    
+    # 弱い手 (Equity 25-45%)
+    elif equity > 0.25:
+        if 'call' in valid_actions: strategy['call'] = 0.3
+        if 'check' in valid_actions: strategy['check'] = 0.5
+        if 'fold' in valid_actions: strategy['fold'] = 0.5
+        # ブラフ: 低確率でレイズ
+        if 'raise_67' in valid_actions: strategy['raise_67'] = 0.05
+    
+    # ほぼゴミ (Equity < 25%)
+    else:
+        if 'check' in valid_actions: strategy['check'] = 0.4
+        if 'fold' in valid_actions: strategy['fold'] = 0.6
+        # ブラフ: 極低確率で大きなレイズ
+        if 'raise_100' in valid_actions: strategy['raise_100'] = 0.02
 
-    # valid_actions にないものを除去して正規化
-    filtered = {a: base.get(a, 0.0) for a in valid_actions}
-    total = sum(filtered.values())
-    if total == 0:
-        n = len(valid_actions)
-        return {a: 1.0 / n for a in valid_actions}
-    return {a: v / total for a, v in filtered.items()}
+    # 合計を 1.0 に正規化
+    total = sum(strategy.values())
+    if total > 0:
+        return {a: v / total for a, v in strategy.items()}
+    else:
+        # 万が一の場合は等確率
+        return {a: 1.0/len(valid_actions) for a in valid_actions}

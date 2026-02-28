@@ -224,10 +224,10 @@ def _analyze_rare_states(
             known_common.add(state_key)
         else:
             rare_count += 1
-            parts = state_key.split(':')
+            parts = state_key.split('_')
             # preflop はボードがないためテクスチャは 'na'; スキップ
-            if len(parts) >= 3 and parts[0] != 'preflop':
-                texture_counter[parts[2]] += 1
+            if len(parts) >= 2 and parts[0] != 'preflop':
+                texture_counter[parts[1]] += 1
 
     target_textures = frozenset(texture_counter.keys())
     summary = {
