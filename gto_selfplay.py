@@ -3,6 +3,7 @@ gto_selfplay.py
 
 GtoCpu 同士の自動対戦による事前学習スクリプト。
 マルチプロセスで複数テーブルを並列実行し、結果をマージして保存する。
+正常終了後、自動的にレア状態の集中学習（gto_rare_training）も実行する。
 
 使用例:
     uv run python gto_selfplay.py                          # 1000 ハンド / 自動並列
@@ -12,6 +13,7 @@ GtoCpu 同士の自動対戦による事前学習スクリプト。
     uv run python gto_selfplay.py --workers 1              # シングルプロセス
     uv run python gto_selfplay.py --save custom.json --sims 200
     uv run python gto_selfplay.py --verbose                # ゲーム出力を表示
+    uv run python gto_selfplay.py --no-rare                # レア学習をスキップ
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ from tqdm import tqdm
 
 from gto_cpu import GtoCpu
 from gto_cfr import SimpleMCCFR
+from gto_rare_training import run_rare_training
 from learning_game import LearningGame
 
 
@@ -159,6 +162,7 @@ def run_selfplay(
     num_workers: int,
     verbose: bool,
     max_seconds: float | None = None,
+    run_rare: bool = True,
 ) -> None:
     start_chips = 1000
     effective_workers = num_workers if num_hands is None else min(num_workers, num_hands)
@@ -211,7 +215,11 @@ def run_selfplay(
         finally:
             pbar.close()
             num_states = _save_merged(all_results, save_path)
-            print(f"✓ 学習完了: {total_hands} ハンド / {num_states} 状態 → {save_path}")
+            print(f"[完了] {total_hands} ハンド / {num_states} 状態 → {save_path}")
+        if run_rare:
+            # selfplay 時間の 20%（最低 1 分）
+            rare_secs = max(60.0, max_seconds * 0.2)
+            _run_rare_phase(num_players, save_path, num_simulations, num_workers, rare_secs)
         return
 
     # ── ハンド数ベースモード ─────────────────────────
@@ -246,7 +254,32 @@ def run_selfplay(
                     )
 
     num_states = _save_merged(all_results, save_path)
-    print(f"✓ 学習完了: {num_states} 状態 → {save_path}")
+    print(f"[完了] {num_states} 状態 → {save_path}")
+
+    if run_rare:
+        # ハンド数ベースの場合は固定 2 分
+        _run_rare_phase(num_players, save_path, num_simulations, num_workers,
+                        rare_secs=120.0)
+
+
+def _run_rare_phase(
+    num_players: int,
+    save_path: str,
+    num_simulations: int,
+    num_workers: int,
+    rare_secs: float,
+) -> None:
+    """selfplay 完了後に続けてレア状態の集中学習を実行する。"""
+    minutes = rare_secs / 60
+    print(f"\n── レア状態の集中学習を開始します（{minutes:.1f} 分間）──")
+    run_rare_training(
+        max_seconds=rare_secs,
+        num_players=num_players,
+        save_path=save_path,
+        num_simulations=num_simulations,
+        num_workers=num_workers,
+        threshold=100,
+    )
 
 
 # ──────────────────────────────────────────────
@@ -290,6 +323,10 @@ def main() -> None:
         "--verbose", action="store_true",
         help="ゲームの出力を表示する（シングルプロセスモードのみ有効）",
     )
+    parser.add_argument(
+        "--no-rare", action="store_true",
+        help="selfplay 後のレア状態集中学習をスキップする",
+    )
     args = parser.parse_args()
 
     run_selfplay(
@@ -300,6 +337,7 @@ def main() -> None:
         num_workers=args.workers,
         verbose=args.verbose,
         max_seconds=args.minutes * 60 if args.minutes else None,
+        run_rare=not args.no_rare,
     )
 
 

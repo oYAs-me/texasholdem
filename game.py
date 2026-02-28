@@ -9,7 +9,7 @@ from colorama import Fore, Style, init
 init(autoreset=True)
 
 class Game:
-    def __init__(self, players: List[Player], start_chips: int = 1000, sb: int = 10, bb: int = 20):
+    def __init__(self, players: List[Player], start_chips: int = 1000, sb: int = 10, bb: int = 20, silent: bool = False):
         self.players = players
         self.deck: List[Card] = []
         self.board = Board()
@@ -18,9 +18,14 @@ class Game:
         self.small_blind = sb
         self.big_blind = bb
         self.current_bet: int = 0
+        self.silent = silent
         
         for p in self.players:
             p.chips = start_chips
+
+    def _log(self, message: str = ""):
+        if not self.silent:
+            print(message)
 
     def get_active_players(self) -> List[Player]:
         return [p for p in self.players if p.status in ('active', 'all-in')]
@@ -29,7 +34,7 @@ class Game:
         return [p for p in self.players if p.status != 'folded' and p.status != 'busted']
 
     def start_round(self):
-        print(f"\n{Fore.GREEN}=== 新しいラウンドを開始します ==={Style.RESET_ALL}")
+        self._log(f"\n{Fore.GREEN}=== 新しいラウンドを開始します ==={Style.RESET_ALL}")
         self.deck = create_deck()
         random.shuffle(self.deck)
         self.board = Board()
@@ -41,7 +46,7 @@ class Game:
             
         contesting = self.get_contesting_players()
         if len(contesting) < 2:
-            print("プレイヤーが足りません。ゲーム終了です。")
+            self._log("プレイヤーが足りません。ゲーム終了です。")
             return False
 
         sb_pos = (self.dealer_pos + 1) % len(self.players)
@@ -51,15 +56,15 @@ class Game:
         while self.players[bb_pos].status == 'busted':
             bb_pos = (bb_pos + 1) % len(self.players)
             
-        print(f"ディーラー: {Fore.CYAN}{self.players[self.dealer_pos].name}{Style.RESET_ALL}")
+        self._log(f"ディーラー: {Fore.CYAN}{self.players[self.dealer_pos].name}{Style.RESET_ALL}")
         
         # ブラインド支払い
         sb_amount = self.players[sb_pos].pay(self.small_blind)
         bb_amount = self.players[bb_pos].pay(self.big_blind)
         self.pot += (sb_amount + bb_amount)
         self.current_bet = self.big_blind
-        print(f"{Fore.YELLOW}{self.players[sb_pos].name}{Style.RESET_ALL} がSB {sb_amount} を支払いました。")
-        print(f"{Fore.YELLOW}{self.players[bb_pos].name}{Style.RESET_ALL} がBB {bb_amount} を支払いました。")
+        self._log(f"{Fore.YELLOW}{self.players[sb_pos].name}{Style.RESET_ALL} がSB {sb_amount} を支払いました。")
+        self._log(f"{Fore.YELLOW}{self.players[bb_pos].name}{Style.RESET_ALL} がBB {bb_amount} を支払いました。")
 
         for p in contesting:
             card1 = self.deck.pop()
@@ -71,7 +76,7 @@ class Game:
         if not self.start_round(): return False
             
         # プリフロップ
-        print(f"\n{Fore.BLUE}[プリフロップ]{Style.RESET_ALL}")
+        self._log(f"\n{Fore.BLUE}[プリフロップ]{Style.RESET_ALL}")
         
         # BBの位置を特定
         sb_pos = (self.dealer_pos + 1) % len(self.players)
@@ -93,13 +98,13 @@ class Game:
         # 以降の各ストリート
         streets = [("フロップ", 3), ("ターン", 1), ("リバー", 1)]
         for name, count in streets:
-            print(f"\n{Fore.BLUE}[{name}]{Style.RESET_ALL}")
+            self._log(f"\n{Fore.BLUE}[{name}]{Style.RESET_ALL}")
             cards = [self.deck.pop() for _ in range(count)]
             if name == "フロップ": self.board.set_flops(tuple(cards))
             elif name == "ターン": self.board.set_turn(cards[0])
             elif name == "リバー": self.board.set_river(cards[0])
             
-            print(f"ボード: [{Player.hand_output_format(self.board.get_all_cards())}]")
+            self._log(f"ボード: [{Player.hand_output_format(self.board.get_all_cards())}]")
             
             # ディーラーの次（SBの位置）から開始
             start_idx = (self.dealer_pos + 1) % len(self.players)
@@ -166,16 +171,16 @@ class Game:
                 # 表示ロジック
                 name_fmt = f"{Fore.CYAN}{p.name:^7}{Style.RESET_ALL}"
                 if action == 'fold':
-                    print(f"[{name_fmt}] {Fore.RED}fold{Style.RESET_ALL}")
+                    self._log(f"[{name_fmt}] {Fore.RED}fold{Style.RESET_ALL}")
                     p.status = 'folded'
                 elif action == 'check':
-                    print(f"[{name_fmt}] check")
+                    self._log(f"[{name_fmt}] check")
                     p.pay(0)
                 elif action == 'call':
                     pay_amt = p.pay(call_amount)
                     p.round_bet += pay_amt
                     self.pot += pay_amt
-                    print(f"[{name_fmt}] {Fore.BLUE}call{Style.RESET_ALL} (支払: {pay_amt})")
+                    self._log(f"[{name_fmt}] {Fore.BLUE}call{Style.RESET_ALL} (支払: {pay_amt})")
                 elif action == 'raise':
                     actual_raise_to = max(amount, round_max_bet + self.big_blind)
                     increment = actual_raise_to - round_max_bet
@@ -185,7 +190,7 @@ class Game:
                     round_max_bet = p.round_bet
                     last_raiser = current_idx
                     action_label = "bet" if call_amount == 0 else "raise"
-                    print(f"[{name_fmt}] {Fore.YELLOW}{action_label:5}{Style.RESET_ALL} {round_max_bet} (+{increment})")
+                    self._log(f"[{name_fmt}] {Fore.YELLOW}{action_label:5}{Style.RESET_ALL} {round_max_bet} (+{increment})")
             
             if len(self.get_contesting_players()) == 1: return False
             next_idx = (current_idx + 1) % len(self.players)
@@ -211,12 +216,12 @@ class Game:
         winners = self.get_contesting_players()
         if winners:
             winner = winners[0]
-            print(f"\n{Fore.GREEN}{winner.name} の勝利！ ポット {self.pot} を獲得しました。{Style.RESET_ALL}")
+            self._log(f"\n{Fore.GREEN}{winner.name} の勝利！ ポット {self.pot} を獲得しました。{Style.RESET_ALL}")
             winner.receive_winnings(self.pot)
         self.move_dealer()
 
     def showdown(self):
-        print(f"\n{Fore.MAGENTA}--- ショーダウン ---{Style.RESET_ALL}")
+        self._log(f"\n{Fore.MAGENTA}--- ショーダウン ---{Style.RESET_ALL}")
         contesting = self.get_contesting_players()
         evaluated_hands = []
         for p in contesting:
@@ -227,8 +232,8 @@ class Game:
                 # 手札とベスト5枚の表示
                 h_str = Player.hand_output_format(p.hand.cards)
                 best_str = Player.hand_output_format(ev_hand.best_cards)
-                print(f"{Fore.CYAN}{p.name:^7}{Style.RESET_ALL}: [{h_str}]")
-                print(f"  -> {Fore.MAGENTA}{ev_hand.hand_type:15}{Style.RESET_ALL} [{best_str}]")
+                self._log(f"{Fore.CYAN}{p.name:^7}{Style.RESET_ALL}: [{h_str}]")
+                self._log(f"  -> {Fore.MAGENTA}{ev_hand.hand_type:15}{Style.RESET_ALL} [{best_str}]")
 
         # 役の強さでソート
         evaluated_hands.sort(key=lambda x: x['ev'].value, reverse=True)
@@ -257,12 +262,13 @@ class Game:
             
             share = total_winnable // len(winners)
             for w in winners:
-                print(f"{Fore.GREEN}{w.name} がポット {share} を獲得しました！{Style.RESET_ALL}")
+                self._log(f"{Fore.GREEN}{w.name} がポット {share} を獲得しました！{Style.RESET_ALL}")
                 w.receive_winnings(share)
             if total_winnable % len(winners) != 0:
                 winners[0].receive_winnings(total_winnable % len(winners))
 
         self.move_dealer()
+
 
     def move_dealer(self):
         self.dealer_pos = (self.dealer_pos + 1) % len(self.players)
