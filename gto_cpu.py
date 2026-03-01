@@ -11,15 +11,17 @@ player.py / game.py への変更は不要。
     players.append(GtoCpu("GTO-CPU", chips=1000))
 """
 from __future__ import annotations
+import os
 import random
 from typing import Any
 
 from player import CpuAgent
 from card import Board
-from probability import calculate_equity
+from fast_eval import calculate_equity_fast
 from gto_strategy import build_state_key, get_equity_bucket, get_street, heuristic_strategy
 from gto_cfr import SimpleMCCFR
 from hand_strength import evaluate_hand
+import numpy as np
 
 _DEFAULT_SAVE_PATH = "gto_strategy.json"
 
@@ -75,13 +77,18 @@ class GtoCpu(CpuAgent):
         save_path: str = _DEFAULT_SAVE_PATH,
         num_simulations: int = 400,
         n_realtime: int = 20,
+        load_path: str | None = None,
     ) -> None:
         super().__init__(name, chips)
         self._save_path = save_path
         self._num_simulations = num_simulations
         self._n_realtime = n_realtime
         self.cfr = SimpleMCCFR()
-        self.cfr.load(save_path)
+        self._rng = np.random.default_rng()
+
+        effective_load = load_path if load_path is not None else save_path
+        if effective_load != os.devnull:
+            self.cfr.load(effective_load)
 
         # CFR 学習用の行動履歴（ラウンドごとにリセット）
         self._action_history: list[dict[str, Any]] = []
@@ -107,12 +114,13 @@ class GtoCpu(CpuAgent):
             if p['status'] in ('active', 'all-in') and p['name'] != self.name
         ])
 
-        # ── エクイティ計算（既存モジュールを流用）──
+        # ── エクイティ計算（高速評価器使用）──
         equity = 0.5
         if self.hand is not None:
-            equity = calculate_equity(
+            equity = calculate_equity_fast(
                 self.hand, board, max(num_opponents, 1),
                 num_simulations=self._num_simulations,
+                rng=self._rng,
             )
 
         eq_bucket = get_equity_bucket(equity)

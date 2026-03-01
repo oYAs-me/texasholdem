@@ -2,6 +2,8 @@ from typing import Any
 from colorama import Fore, Style
 from card import Hand, Board, Card
 from probability import calculate_equity, calculate_hand_distribution
+from fast_eval import calculate_equity_fast
+import numpy as np
 
 class Player:
     def __init__(self, name: str, chips: int):
@@ -96,6 +98,10 @@ class HumanPlayer(Player):
             print("無効なアクションです。")
 
 class CpuAgent(Player):
+    def __init__(self, name: str, chips: int):
+        super().__init__(name, chips)
+        self._rng = np.random.default_rng()
+
     def decide_action(self, valid_actions: list[str], game_state: dict[str, Any]) -> tuple[str, int]:
         call_amount = game_state['call_amount']
         pot = game_state['pot']
@@ -103,7 +109,8 @@ class CpuAgent(Player):
         num_opponents = len([p for p in game_state['players'] if p['status'] in ('active', 'all-in')]) - 1
         equity = 0.5
         if self.hand and board:
-            equity = calculate_equity(self.hand, board, num_opponents, num_simulations=400)
+            equity = calculate_equity_fast(self.hand, board, num_opponents,
+                                           num_simulations=400, rng=self._rng)
         if pot > 0 and call_amount > 0:
             bet_ratio = call_amount / pot
             if bet_ratio > 0.5: equity *= (1.0 - (min(bet_ratio, 1.5) * 0.2))
