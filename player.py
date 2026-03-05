@@ -155,3 +155,46 @@ class AggressiveCpu(CpuAgent):
         if equity > pot_odds - 0.05 or call_amount == 0 or random.random() < 0.1:
             return 'call' if 'call' in valid_actions else 'check', call_amount
         return 'fold', 0
+
+
+class StyledCpu(CpuAgent):
+    """
+    スタイルパラメータ(0.0=コンサバ〜1.0=アグレッシブ)で動作が連続的に変化するCPU。
+
+    各閾値をスタイル値で線形補間する:
+        call_edge    : pot_odds 超過の必要マージン (0.15 → -0.05)
+        raise_thresh : レイズを選ぶ最低エクイティ (0.80 → 0.55)
+        raise_factor : ベットサイズ係数           (0.80 → 1.20)
+        bluff_prob   : ランダムブラフ確率          (0.00 → 0.15)
+        loose_prob   : ルーズコール確率            (0.00 → 0.10)
+    """
+
+    def __init__(self, name: str, chips: int, style: float = 0.5) -> None:
+        super().__init__(name, chips)
+        s = float(np.clip(style, 0.0, 1.0))
+        self._call_edge    = 0.15 - s * 0.20
+        self._raise_thresh = 0.80 - s * 0.25
+        self._raise_factor = 0.80 + s * 0.40
+        self._bluff_prob   = s * 0.15
+        self._loose_prob   = s * 0.10
+
+    def _smart_action(
+        self, equity: float, pot_odds: float,
+        valid_actions: list[str], game_state: dict,
+    ) -> tuple[str, int]:
+        call_amount = game_state['call_amount']
+        can_call = (
+            equity > pot_odds + self._call_edge
+            or call_amount == 0
+            or self._rng.random() < self._loose_prob
+        )
+        if can_call:
+            if (equity > self._raise_thresh or self._rng.random() < self._bluff_prob) \
+                    and 'raise' in valid_actions:
+                size = self._get_dynamic_raise_size(
+                    game_state['pot'], game_state['min_raise'],
+                    equity, self._raise_factor,
+                )
+                return 'raise', size
+            return ('call' if 'call' in valid_actions else 'check'), call_amount
+        return 'fold', 0

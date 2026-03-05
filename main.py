@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import sys
 import time
 from collections import defaultdict
@@ -8,7 +9,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from colorama import Fore, Style
 from tqdm import tqdm
 
-from player import HumanPlayer, ConservativeCpu, BalancedCpu, AggressiveCpu
+from player import HumanPlayer, StyledCpu
 from gto_cpu import GtoCpu
 from bayesian_cpu import BayesianCpu
 from learning_game import LearningGame as Game
@@ -17,18 +18,46 @@ from learning_game import LearningGame as Game
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+# スタイル値 → 名前のラベル
+_STYLE_LABELS = ["Tight", "Careful", "Balanced", "Loose", "Aggro"]
+
+def _style_label(s: float) -> str:
+    """スタイル値 0〜1 を 5 段階ラベルに変換する。"""
+    idx = min(int(s * len(_STYLE_LABELS)), len(_STYLE_LABELS) - 1)
+    return _STYLE_LABELS[idx]
+
 
 def _make_cpu_players(num_players, initial_chips, num_simulations):
-    pool = [
-        ConservativeCpu("Conservative", chips=initial_chips),
-        BalancedCpu("Balanced-1",      chips=initial_chips),
-        BalancedCpu("Balanced-2",      chips=initial_chips),
-        AggressiveCpu("Aggressive",    chips=initial_chips),
-        # GtoCpu("GTO-CPU",             chips=initial_chips, num_simulations=num_simulations),
-        BayesianCpu("Bayesian",        chips=initial_chips),
+    """
+    固定の BayesianCpu + グラデーション StyledCpu でプレイヤープールを生成する。
+
+    StyledCpu の style 値は stratified sampling（均等区間内でランダム）で決定する。
+    これにより各マッチで conservative〜aggressive の多様な対戦相手が生成される。
+    """
+    fixed = [
+        BayesianCpu("Bayesian", chips=initial_chips),
+        # GtoCpu("GTO-CPU", chips=initial_chips, num_simulations=num_simulations),
     ]
-    extra = [BalancedCpu(f"Balanced-{j+3}", chips=initial_chips) for j in range(max(0, num_players - len(pool)))]
-    return (pool + extra)[:num_players]
+    num_styled = max(1, num_players - len(fixed))
+
+    # Stratified sampling: [0,1] を num_styled 個の等幅区間に分割し、各区間内でランダムに選択
+    styles = [
+        random.uniform(i / num_styled, (i + 1) / num_styled)
+        for i in range(num_styled)
+    ]
+    random.shuffle(styles)  # 対戦順（ブラインド位置）にも多様性を持たせる
+
+    # 同一ラベルが複数出る場合に通し番号を付ける
+    label_counts: dict[str, int] = {}
+    styled: list[StyledCpu] = []
+    for s in styles:
+        label = _style_label(s)
+        cnt = label_counts.get(label, 0)
+        name = label if cnt == 0 else f"{label}-{cnt}"
+        label_counts[label] = cnt + 1
+        styled.append(StyledCpu(name, chips=initial_chips, style=s))
+
+    return (fixed + styled)[:num_players]
 
 
 def _play_one_match(args):

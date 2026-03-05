@@ -160,7 +160,7 @@ class BayesianCpu(CpuAgent):
             equity = float(np.clip(equity - adj, 0.05, 0.95))
 
         pot_odds = call_amount / (pot + call_amount) if (pot + call_amount) > 0 else 0.0
-        return self._bayesian_action(equity, pot_odds, valid_actions, game_state)
+        return self._bayesian_action(equity, pot_odds, valid_actions, game_state, active_opponents)
 
     # ── 内部ヘルパー ─────────────────────────────────────────────────────
 
@@ -187,7 +187,7 @@ class BayesianCpu(CpuAgent):
                 mean_s = self._profiles[name].avg_showdown_strength
             else:
                 continue
-            total += (mean_s - 0.5) * 0.25
+            total += (mean_s - 0.5) * 0.45   # 0.25 → 0.45 : 相手レンジへの感度を強化
             counted += 1
         return total / counted if counted > 0 else 0.0
 
@@ -197,21 +197,62 @@ class BayesianCpu(CpuAgent):
         pot_odds: float,
         valid_actions: list[str],
         game_state: dict,
+        active_opponents: list[dict] | None = None,
     ) -> tuple[str, int]:
-        """調整済みエクイティに基づくアクション決定（バランスド寄りのスタイル）。"""
+        """
+        調整済みエクイティに基づくアクション決定。
+
+        スタック管理の方針:
+            - レイズ額が残チップの 45% 超 かつ エクイティ < 0.85 → コール/チェックに格下げ
+              （対戦相手の強いベットに対して意図しないオールインを防ぐ）
+            - 相手ベットに直面中（call_amount > 0）は再レイズ閾値を 0.60 → 0.67 に引き上げる
+              （相手の aggression を respect してコールを優先する）
+            - コール額が残チップの 65% 超 かつ エクイティ < break-even+α → フォールド
+              （弱いハンドでのオールインコールを防ぐ; 多人数戦では閾値を下げる）
+        """
         call_amount = game_state['call_amount']
         pot = game_state['pot']
         min_raise = game_state.get('min_raise', max(call_amount * 2, 1))
+        # コール分も含めた実効ポット（レイズサイズ計算を適切にする）
+        effective_pot = pot + call_amount
 
-        if equity > 0.72 and 'raise' in valid_actions:
-            size = self._get_dynamic_raise_size(pot, min_raise, equity, 1.1)
+        facing_bet = call_amount > 0
+        # 相手ベットに直面しているときは再レイズの閾値を上げる
+        reraise_threshold = 0.67 if facing_bet else 0.60
+
+        # 多人数戦ではbreak-evenエクイティが下がるため、オールインコール閾値を調整する
+        # 1人: 0.55, 2人: 0.38, 3人: 0.30, 4人以上: 0.30
+        num_opps = len(active_opponents) if active_opponents else 1
+        allin_fold_threshold = max(0.30, 1.0 / (num_opps + 1) + 0.05)
+
+        def _guarded_raise(size: int, stack_limit: float, equity_override: float) -> tuple[str, int]:
+            """スタック制限を超えるレイズはコール/チェックに格下げする。"""
+            if size > self.chips * stack_limit and equity < equity_override:
+                return ('call' if 'call' in valid_actions else 'check'), call_amount
             return 'raise', size
 
-        if equity > pot_odds + 0.07 or call_amount == 0:
-            if equity > 0.60 and 'raise' in valid_actions:
-                size = self._get_dynamic_raise_size(pot, min_raise, equity, 0.9)
-                return 'raise', size
+        def _guarded_call() -> tuple[str, int]:
+            """オールインに近いコールは弱いハンドでフォールドに格下げする。
+            閾値は対戦人数によって調整される（多人数ほど低くなる）。
+            """
+            if (call_amount > 0
+                    and call_amount >= self.chips * 0.65
+                    and equity < allin_fold_threshold
+                    and 'fold' in valid_actions):
+                return 'fold', 0
             return ('call' if 'call' in valid_actions else 'check'), call_amount
+
+        # 高エクイティ域: アグレッシブにレイズ（スタック管理あり）
+        if equity > 0.75 and 'raise' in valid_actions:
+            size = self._get_dynamic_raise_size(effective_pot, min_raise, equity, 1.1)
+            return _guarded_raise(size, stack_limit=0.45, equity_override=0.85)
+
+        # 中エクイティ域: ポットオッズ優位かチェック機会があればレイズ検討
+        if equity > pot_odds + 0.07 or call_amount == 0:
+            if equity > reraise_threshold and 'raise' in valid_actions:
+                size = self._get_dynamic_raise_size(effective_pot, min_raise, equity, 0.9)
+                return _guarded_raise(size, stack_limit=0.40, equity_override=0.80)
+            return _guarded_call()
 
         return 'fold', 0
 
