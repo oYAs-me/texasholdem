@@ -20,6 +20,7 @@ import math
 import numpy as np
 
 from card import Card, Hand, Board, create_deck
+from fast_eval import evaluate_7_score, card_to_int as _fast_card_to_int
 
 # ──────────────────────────────────────────────
 # 定数
@@ -228,58 +229,67 @@ def _log_likelihood_groups(
     pot:    アクション前のポット
     profile: 対戦相手のプロファイル（None の場合はデフォルト値を使用）
 
-    プロファイル活用の考え方:
-        VPIP が低い（タイト）プレイヤー:
-          - fold → 非常に弱い手の強い証拠（強い手はプレイするはず）
-          - call → 強い手の強い証拠（通常は弱い手でプレイしない）
-        VPIP が高い（ルーズ）プレイヤー:
-          - fold → まずまずの手でもありうる（判断基準が甘い）
-          - call → 弱い手でもコールしうる
-        AF が高い（アグレッシブ）プレイヤー:
-          - raise → ブラフ比率が高い（二極化が強い）
+    設計方針:
+        手動調整パラメータを廃止し、VPIP/PFR/AF から直接導出するシグモイド閾値モデル。
+        Fold range  : 強度 < fold_threshold (1-VPIP パーセンタイル)
+        Call range  : fold_threshold <= 強度 < raise_threshold (1-PFR パーセンタイル)
+        Raise range : 強度 >= raise_threshold + AF 比例のブラフ成分
+
+        np.percentile(_GROUP_STRENGTHS, ...) で 169 グループの実分布から閾値を導出するため、
+        Tight (VPIP=0.15) のような極端なスタイルにも整合した尤度が得られる。
     """
     s = _GROUP_STRENGTHS.astype(np.float64)   # (169,)
     bet_ratio = float(amount) / max(float(pot), 1.0)
 
     # プロファイルから統計量を取得（データ不足時はデフォルト）
     if profile is not None and profile.has_profile:
-        vpip = profile.vpip_rate
-        af = profile.aggression_factor
+        vpip = float(np.clip(profile.vpip_rate, 0.05, 0.95))
+        pfr  = float(np.clip(profile.pfr_rate,  0.03, vpip))
+        af   = profile.aggression_factor
     else:
-        vpip = 0.5   # 中間的なプレイヤーと仮定
-        af = 1.0
+        vpip, pfr, af = 0.50, 0.25, 1.0
+
+    # VPIP/PFR から _GROUP_STRENGTHS の実分布に基づく閾値を導出
+    fold_threshold  = float(np.percentile(_GROUP_STRENGTHS, (1.0 - vpip) * 100.0))
+    raise_threshold = float(np.percentile(_GROUP_STRENGTHS, (1.0 - pfr)  * 100.0))
+    fold_threshold  = min(fold_threshold, raise_threshold - 0.01)
+
+    # シグモイドの鋭さ: タイトほど閾値が明確（境界が急峻）
+    # VPIP=0.15->6.8, VPIP=0.30->4.4, VPIP=0.50->2.0, VPIP=0.80->min1.0
+    k = float(np.clip(2.0 + (0.5 - vpip) * 8.0, 1.0, 10.0))
+
+    def _sig(x: np.ndarray, center: float) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-k * (x - center)))
 
     if action == 'fold':
-        # タイトなプレイヤー（低VPIP）の fold は「非常に弱い手」の強い証拠
-        # fold_sharpness: VPIP=0.2→3.4, VPIP=0.5→1.0, VPIP=0.8→0.4
-        fold_sharpness = max(0.4, (1.0 - vpip) * 4.0 - 0.6)
-        raw = (1.0 - s) ** fold_sharpness + 0.02
+        # P(fold | s) ~ 1 - P(ポット参加 | s)
+        raw = 1.0 - _sig(s, fold_threshold) + 0.01
 
     elif action == 'check':
-        # タイトなプレイヤーのチェックは「中程度」の手（強い手はベットする）
-        raw = 0.10 + 0.80 * np.clip(1.0 - (s - 0.45) ** 2 * 4.0, 0, 1)
+        # コールレンジ中間帯 + パッシブプレイヤーのスローダウン
+        mid   = (fold_threshold + raise_threshold) / 2.0
+        width = max(raise_threshold - fold_threshold, 0.05)
+        raw   = 0.05 + 0.60 * np.exp(-((s - mid) ** 2) / (width ** 2))
+        raw  += max(0.0, 1.0 - af) * 0.20 * s
 
     elif action == 'call':
-        # タイトなプレイヤーのコールはより強い手の証拠
-        # strength_exponent: VPIP=0.2→2.4, VPIP=0.5→1.5, VPIP=0.8→0.6
-        strength_exponent = max(0.5, (1.0 - vpip) * 3.0)
-        factor = max(0.15, 1.0 - bet_ratio * 0.5)
-        raw = factor * (0.05 + s ** strength_exponent)
+        # コールバンド: fold_threshold <= s < raise_threshold
+        bet_pressure = float(np.clip(1.0 - bet_ratio * 0.40, 0.30, 1.0))
+        in_band = _sig(s, fold_threshold) * (1.0 - _sig(s, raise_threshold))
+        raw = bet_pressure * in_band + 0.03
 
     else:  # raise / bet
-        # AF が高いプレイヤーはブラフ的なレイズが多い（二極化を強める）
-        # bluff_share: AF=0.5→0.2, AF=1→0.25, AF=3→0.38
-        bluff_share = min(af / (af + 3.0), 0.4)
-        value_share = 1.0 - bluff_share
-        if bet_ratio > 1.0:
-            # 大きなベット: 価値レイズ + ブラフの二極化
-            raw = 0.03 + value_share * 0.65 * s ** 2 + bluff_share * 0.25 * (1.0 - s) ** 2
+        bluff_rate = float(np.clip(af / (af + 3.0), 0.05, 0.45))
+        value_raw  = _sig(s, raise_threshold)
+        bluff_center = max(0.08, fold_threshold - 0.15)
+        bluff_raw = np.exp(-((s - bluff_center) ** 2) / (0.12 ** 2))
+        if bet_ratio > 0.75:
+            raw = 0.02 + (1.0 - bluff_rate) * value_raw + bluff_rate * bluff_raw
         else:
-            # 通常サイズ: 主に価値レイズ
-            raw = 0.03 + value_share * 0.70 * s + bluff_share * 0.15
+            raw = 0.02 + (1.0 - bluff_rate * 0.5) * value_raw \
+                + bluff_rate * 0.5 * bluff_raw + 0.05
 
     return np.log(np.clip(raw, 1e-6, None))
-
 
 def _log_likelihood_combos(
     action: str,
@@ -419,6 +429,157 @@ class BeliefTracker:
             return 0.5
         probs /= total
         return float(np.dot(probs, _GROUP_STRENGTHS[_COMBO_TO_GROUP]))
+
+    def get_combo_weights(self, dead_card_ints: set[int]) -> np.ndarray:
+        """
+        デッドカード除外後の 1326 コンボ重み（正規化済み）を返す。
+
+        プリフロップ・ポストフロップ両対応。
+        返り値を calculate_equity_vs_range に渡すと、
+        推定レンジに対するエクイティが直接計算される。
+        """
+        if self._is_postflop and self._log_p_1326 is not None:
+            log_p = self._log_p_1326.copy()
+        else:
+            # グループ確率 → コンボに均等展開
+            group_sizes = np.bincount(_COMBO_TO_GROUP, minlength=NUM_GROUPS).astype(np.float64)
+            log_p = (
+                self._log_p[_COMBO_TO_GROUP]
+                - np.log(group_sizes[_COMBO_TO_GROUP] + 1e-12)
+            )
+
+        # デッドカードを含むコンボをベクトル化マスク
+        if dead_card_ints:
+            dead_arr = np.fromiter(dead_card_ints, dtype=np.int32, count=len(dead_card_ints))
+            dead_mask = np.isin(_COMBO_C1_IDX, dead_arr) | np.isin(_COMBO_C2_IDX, dead_arr)
+            log_p[dead_mask] = -np.inf
+
+        finite = np.isfinite(log_p)
+        if not np.any(finite):
+            # フォールバック: 均等分布
+            return np.full(NUM_COMBOS, 1.0 / NUM_COMBOS, dtype=np.float64)
+
+        log_p -= np.max(log_p[finite])
+        weights = np.where(finite, np.exp(log_p), 0.0)
+        weights /= weights.sum()
+        return weights
+
+
+# ──────────────────────────────────────────────
+# レンジ対応エクイティ計算
+# ──────────────────────────────────────────────
+
+_ALL_INTS = np.arange(52, dtype=np.int32)  # 0-51 全カード整数
+
+
+def calculate_equity_vs_range(
+    my_hand: Hand,
+    board: Board,
+    tracker_weights: list[np.ndarray | None],
+    num_simulations: int = 300,
+    rng: np.random.Generator | None = None,
+) -> float:
+    """
+    推定レンジに対するエクイティを計算する。
+
+    tracker_weights[i]:
+        BeliefTracker.get_combo_weights() の出力（1326次元の重み配列）。
+        None の場合はその相手をランダムサンプリング。
+
+    戻り値: 0.0〜1.0 のエクイティ（高いほど自分が有利）
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    my_ints = [_fast_card_to_int(c) for c in my_hand.cards]
+    board_ints = [_fast_card_to_int(c) for c in board.get_all_cards()]
+    base_dead = set(my_ints + board_ints)
+    n_board_needed = 5 - len(board_ints)
+
+    # トラッカーがある相手のコンボを事前バッチサンプリング
+    presampled: list[np.ndarray | None] = []
+    for weights in tracker_weights:
+        if weights is not None:
+            cidxs = rng.choice(NUM_COMBOS, size=num_simulations, p=weights, replace=True)
+            presampled.append(cidxs)
+        else:
+            presampled.append(None)
+
+    my_7 = [0] * 7
+    opp_7 = [0] * 7
+    my_7[0], my_7[1] = my_ints[0], my_ints[1]
+
+    # ベースデッドマスク（bool配列で高速化）
+    base_dead_mask = np.zeros(52, dtype=bool)
+    for c in base_dead:
+        base_dead_mask[c] = True
+
+    # 事前確保（copy回避）
+    used_mask = np.empty(52, dtype=bool)
+
+    wins = 0.0
+    valid_count = 0
+
+    for i in range(num_simulations):
+        np.copyto(used_mask, base_dead_mask)  # inplace reset（alloc不要）
+        opp_hands: list[tuple[int, int]] = []
+        ok = True
+
+        for opp_i, presamp in enumerate(presampled):
+            if presamp is not None:
+                cidx = int(presamp[i])
+                c1 = int(_COMBO_C1_IDX[cidx])
+                c2 = int(_COMBO_C2_IDX[cidx])
+                if used_mask[c1] or used_mask[c2]:
+                    # 衝突: bool マスクで高速にフォールバック
+                    avail = _ALL_INTS[~used_mask]
+                    if len(avail) < 2:
+                        ok = False
+                        break
+                    idx = rng.choice(len(avail), size=2, replace=False)
+                    c1, c2 = int(avail[idx[0]]), int(avail[idx[1]])
+            else:
+                avail = _ALL_INTS[~used_mask]
+                if len(avail) < 2:
+                    ok = False
+                    break
+                idx = rng.choice(len(avail), size=2, replace=False)
+                c1, c2 = int(avail[idx[0]]), int(avail[idx[1]])
+
+            opp_hands.append((c1, c2))
+            used_mask[c1] = True
+            used_mask[c2] = True
+
+        if not ok:
+            continue
+
+        # ボード補完
+        if n_board_needed > 0:
+            avail = _ALL_INTS[~used_mask]
+            if len(avail) < n_board_needed:
+                continue
+            extra_idx = rng.choice(len(avail), size=n_board_needed, replace=False)
+            full_board = board_ints + [int(avail[k]) for k in extra_idx]
+        else:
+            full_board = board_ints
+
+        for j in range(5):
+            my_7[2 + j] = full_board[j]
+        my_score = evaluate_7_score(my_7)
+
+        opp_7[2:7] = full_board  # type: ignore[assignment]
+        won = True
+        for c1, c2 in opp_hands:
+            opp_7[0], opp_7[1] = c1, c2
+            if evaluate_7_score(opp_7) > my_score:
+                won = False
+                break
+
+        valid_count += 1
+        if won:
+            wins += 1.0
+
+    return wins / valid_count if valid_count > 0 else 0.5
 
 
 # ──────────────────────────────────────────────

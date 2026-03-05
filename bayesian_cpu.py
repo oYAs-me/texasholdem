@@ -24,8 +24,10 @@ import numpy as np
 
 from player import CpuAgent
 from card import Board, Hand
-from fast_eval import calculate_equity_fast
-from bayesian_strategy import BeliefTracker, PlayerProfile, hand_to_group
+from fast_eval import calculate_equity_fast, card_to_int
+from bayesian_strategy import (
+    BeliefTracker, PlayerProfile, hand_to_group, calculate_equity_vs_range,
+)
 
 
 class BayesianCpu(CpuAgent):
@@ -137,7 +139,6 @@ class BayesianCpu(CpuAgent):
         call_amount: int = game_state['call_amount']
         pot: int = game_state['pot']
         board: Board = game_state['board']
-        min_raise: int = game_state.get('min_raise', max(call_amount * 2, 1))
 
         active_opponents = [
             p for p in game_state['players']
@@ -145,51 +146,81 @@ class BayesianCpu(CpuAgent):
         ]
         num_opponents = len(active_opponents)
 
-        # ── エクイティ計算（高速モンテカルロ）──
+        # ── エクイティ計算 ──────────────────────────────────────────────
+        # トラッカーがある相手には推定レンジに対して直接エクイティを計算する
         equity = 0.5
         if self.hand is not None and num_opponents > 0:
-            equity = calculate_equity_fast(
-                self.hand, board, num_opponents,
-                num_simulations=self._num_simulations,
-                rng=self._rng,
-            )
+            dead_ints: set[int] = {card_to_int(c) for c in self.hand.cards}
+            dead_ints.update(card_to_int(c) for c in board.get_all_cards())
 
-        # ── レンジ推定によるエクイティ補正 ──
-        if self._trackers and active_opponents:
-            adj = self._compute_range_adjustment(active_opponents)
-            equity = float(np.clip(equity - adj, 0.05, 0.95))
+            tracker_weights = []
+            has_tracker = False
+            for opp in active_opponents:
+                name = opp['name']
+                if name in self._trackers:
+                    tracker_weights.append(
+                        self._trackers[name].get_combo_weights(dead_ints)
+                    )
+                    has_tracker = True
+                else:
+                    tracker_weights.append(None)
+
+            if has_tracker:
+                equity = calculate_equity_vs_range(
+                    self.hand, board, tracker_weights,
+                    num_simulations=self._num_simulations, rng=self._rng,
+                )
+            else:
+                equity = calculate_equity_fast(
+                    self.hand, board, num_opponents,
+                    num_simulations=self._num_simulations, rng=self._rng,
+                )
 
         pot_odds = call_amount / (pot + call_amount) if (pot + call_amount) > 0 else 0.0
-        return self._bayesian_action(equity, pot_odds, valid_actions, game_state, active_opponents)
+        return self._bayesian_action(
+            equity, pot_odds, valid_actions, game_state, active_opponents
+        )
 
     # ── 内部ヘルパー ─────────────────────────────────────────────────────
 
-    def _compute_range_adjustment(self, active_opponents: list[dict]) -> float:
+    def _mean_opponent_strength(self, active_opponents: list[dict]) -> float:
         """
-        対戦相手レンジの平均強度からエクイティへの調整値を計算する。
+        アクティブな対戦相手のレンジ平均強度を返す (0=弱〜1=強)。
 
-        プロファイルが利用可能な場合、ショーダウン実績を追加情報として加味する。
-
-        返り値: float
-            正 → 相手レンジが強い → 自エクイティを下げる
-            負 → 相手レンジが弱い → 自エクイティを上げる
+        ベリーフトラッカーが存在する場合はその値を使い、
+        なければ過去のショーダウン実績から推定する。
         """
         total = 0.0
         counted = 0
         for opp in active_opponents:
             name = opp['name']
-            # ベリーフトラッカーが存在する場合（当ラウンドでアクションを観測済み）
             if name in self._trackers:
-                mean_s = self._trackers[name].mean_strength()
+                total += self._trackers[name].mean_strength()
+                counted += 1
             elif name in self._profiles and self._profiles[name].has_profile:
-                # まだアクションを見ていないが過去の統計がある場合:
-                # ショーダウン実績の平均強度を基に調整
-                mean_s = self._profiles[name].avg_showdown_strength
-            else:
-                continue
-            total += (mean_s - 0.5) * 0.45   # 0.25 → 0.45 : 相手レンジへの感度を強化
-            counted += 1
-        return total / counted if counted > 0 else 0.0
+                total += self._profiles[name].avg_showdown_strength
+                counted += 1
+        return total / counted if counted > 0 else 0.5
+
+    def _estimate_fold_equity(
+        self, mean_strength: float, raise_size: int, pot: int, call_amount: int = 0
+    ) -> float:
+        """
+        相手レンジの強度とレイズサイズから、相手がフォールドする確率を推定する。
+
+        - 弱いレンジほどフォールドしやすい (1 - mean_strength)
+        - ポットに対して大きいベットほどフォールドを誘発しやすい
+        - call_amount > 0 の場合（相手がすでにレイズ済み）はpot commitmentで
+          フォールドしにくくなる。call_amount/(pot+call_amount) の割合で割引。
+        上限を 0.75 に設定し（ナッツは絶対フォールドしない）過大推定を防ぐ。
+        """
+        pot_fraction = raise_size / max(pot, 1)
+        raw = (1.0 - mean_strength) * (0.30 + 0.40 * min(pot_fraction, 1.5))
+        # Pot commitment discount: 相手がすでにレイズしているほどfold_eqを減らす
+        if call_amount > 0:
+            commitment = call_amount / max(pot + call_amount, 1)
+            raw *= (1.0 - commitment)
+        return float(np.clip(raw, 0.0, 0.75))
 
     def _bayesian_action(
         self,
@@ -200,59 +231,72 @@ class BayesianCpu(CpuAgent):
         active_opponents: list[dict] | None = None,
     ) -> tuple[str, int]:
         """
-        調整済みエクイティに基づくアクション決定。
+        各アクションの期待値（EV）を算出し、最大EVのアクションを選択する。
 
-        スタック管理の方針:
-            - レイズ額が残チップの 45% 超 かつ エクイティ < 0.85 → コール/チェックに格下げ
-              （対戦相手の強いベットに対して意図しないオールインを防ぐ）
-            - 相手ベットに直面中（call_amount > 0）は再レイズ閾値を 0.60 → 0.67 に引き上げる
-              （相手の aggression を respect してコールを優先する）
-            - コール額が残チップの 65% 超 かつ エクイティ < break-even+α → フォールド
-              （弱いハンドでのオールインコールを防ぐ; 多人数戦では閾値を下げる）
+        EV計算モデル（多人数対応）:
+            EV(Fold)  = 0
+            EV(Call)  = equity × (pot + call) - call
+            EV(Check) = equity × pot
+            EV(Raise to R) = fold_eq_all × pot
+                             + (1 - fold_eq_all) × [equity × total_pot - R]
+            fold_eq_all = fold_eq_per ^ N  （N = 相手人数）
         """
         call_amount = game_state['call_amount']
         pot = game_state['pot']
         min_raise = game_state.get('min_raise', max(call_amount * 2, 1))
-        # コール分も含めた実効ポット（レイズサイズ計算を適切にする）
         effective_pot = pot + call_amount
 
-        facing_bet = call_amount > 0
-        # 相手ベットに直面しているときは再レイズの閾値を上げる
-        reraise_threshold = 0.67 if facing_bet else 0.60
-
-        # 多人数戦ではbreak-evenエクイティが下がるため、オールインコール閾値を調整する
-        # 1人: 0.55, 2人: 0.38, 3人: 0.30, 4人以上: 0.30
         num_opps = len(active_opponents) if active_opponents else 1
-        allin_fold_threshold = max(0.30, 1.0 / (num_opps + 1) + 0.05)
+        mean_s = self._mean_opponent_strength(active_opponents or [])
 
-        def _guarded_raise(size: int, stack_limit: float, equity_override: float) -> tuple[str, int]:
-            """スタック制限を超えるレイズはコール/チェックに格下げする。"""
-            if size > self.chips * stack_limit and equity < equity_override:
-                return ('call' if 'call' in valid_actions else 'check'), call_amount
-            return 'raise', size
+        # ── EV(Fold) ──────────────────────────────────────────────────
+        ev_fold = 0.0
 
-        def _guarded_call() -> tuple[str, int]:
-            """オールインに近いコールは弱いハンドでフォールドに格下げする。
-            閾値は対戦人数によって調整される（多人数ほど低くなる）。
-            """
-            if (call_amount > 0
-                    and call_amount >= self.chips * 0.65
-                    and equity < allin_fold_threshold
-                    and 'fold' in valid_actions):
-                return 'fold', 0
-            return ('call' if 'call' in valid_actions else 'check'), call_amount
+        # ── EV(Call / Check) ──────────────────────────────────────────
+        if call_amount > 0:
+            ev_call = equity * (pot + call_amount) - call_amount
+            action_call = 'call'
+        else:
+            ev_call = equity * pot
+            action_call = 'check' if 'check' in valid_actions else 'call'
 
-        # 高エクイティ域: アグレッシブにレイズ（スタック管理あり）
-        if equity > 0.75 and 'raise' in valid_actions:
-            size = self._get_dynamic_raise_size(effective_pot, min_raise, equity, 1.1)
-            return _guarded_raise(size, stack_limit=0.45, equity_override=0.85)
+        # ── EV(Bet / Raise) — 複数サイズを評価して最善を選ぶ ──────────
+        best_ev_raise = float('-inf')
+        best_raise_size = min_raise
 
-        # 中エクイティ域: ポットオッズ優位かチェック機会があればレイズ検討
-        if equity > pot_odds + 0.07 or call_amount == 0:
-            if equity > reraise_threshold and 'raise' in valid_actions:
-                size = self._get_dynamic_raise_size(effective_pot, min_raise, equity, 0.9)
-                return _guarded_raise(size, stack_limit=0.40, equity_override=0.80)
-            return _guarded_call()
+        if 'raise' in valid_actions:
+            for factor in [0.5, 0.75, 1.0, 1.5, 2.0]:
+                size = max(min_raise, int(effective_pot * factor))
+                size = min(size, self.chips)
+                size = max(((size + 5) // 10) * 10, min_raise)
 
-        return 'fold', 0
+                # Kelly基準: f* = equity - (1-equity) × bet/pot
+                # 多人数ほど不確実性が高く 1/N で割引（分散管理）
+                kelly_f = equity - (1.0 - equity) * size / max(pot, 1)
+                kelly_cap = int(kelly_f * self.chips / num_opps) if kelly_f > 0 else 0
+                if kelly_cap < min_raise:
+                    continue  # Kellyフラクションが小さすぎてmin_raiseに届かない
+                size = min(size, kelly_cap)
+                size = max(((size + 5) // 10) * 10, min_raise)
+
+                # fold_eq: call_amount を渡してpot commitment discountを適用
+                fold_eq_per = self._estimate_fold_equity(mean_s, size, pot, call_amount)
+                fold_eq_all = fold_eq_per ** num_opps
+                exp_callers = num_opps * (1.0 - fold_eq_per)
+                total_pot_called = pot + size + exp_callers * max(0.0, size - call_amount)
+                ev = fold_eq_all * pot + (1.0 - fold_eq_all) * (equity * total_pot_called - size)
+
+                if ev > best_ev_raise:
+                    best_ev_raise = ev
+                    best_raise_size = size
+
+        # ── 最大 EV のアクションを選択 ────────────────────────────────
+        candidates: list[tuple[str, int, float]] = [('fold', 0, ev_fold)]
+        if action_call in valid_actions:
+            candidates.append((action_call, call_amount, ev_call))
+        if 'raise' in valid_actions:
+            candidates.append(('raise', best_raise_size, best_ev_raise))
+
+        best_action, best_amount, _ = max(candidates, key=lambda x: x[2])
+        return best_action, best_amount
 
