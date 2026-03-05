@@ -87,7 +87,7 @@ def evaluate_7_score(cards7) -> int:
         if rc[r] > max_cnt:
             max_cnt = rc[r]
 
-    # フラッシュ用にランク/スートのリストが必要な場合のみ展開
+    # フラッシュ用にスートカウントを確認
     flush_suit = -1
     for i in range(4):
         if sc[i] >= 5:
@@ -95,15 +95,40 @@ def evaluate_7_score(cards7) -> int:
             break
 
     if flush_suit >= 0:
-        # フラッシュ確定 → ランク/スートのリストを展開
-        fr = sorted([c // 4 + 2 for c in cards7 if c % 4 == flush_suit], reverse=True)
-        sf = _straight_high_desc(fr)
-        if sf:
-            return _hs(9 if sf == 14 else 8, sf)
-        return _hs(5, fr[0], 0, fr[1], fr[2], fr[3], fr[4] if len(fr) > 4 else 0)
+        # フラッシュ確定 → ビットマスクでランクを抽出（sorted() を回避）
+        flush_mask = 0
+        for c in cards7:
+            if c % 4 == flush_suit:
+                flush_mask |= (1 << (c // 4 + 2))
 
-    # ランクの最大カウント（早期ルーティング用）
-    max_cnt = max(rc)
+        # ストレートフラッシュ判定（ビットマスク）
+        sf = 0
+        for high in range(14, 4, -1):
+            if (flush_mask >> (high - 4)) & 0b11111 == 0b11111:
+                sf = high
+                break
+        if sf == 0:
+            wheel_mask = (1 << 14) | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2)
+            if (flush_mask & wheel_mask) == wheel_mask:
+                sf = 5
+        if sf:
+            hr = 9 if sf == 14 else 8
+            return hr * _B6 + sf * _B5
+
+        # フラッシュのキッカー（降順スキャン, 上位5枚）
+        fr0 = fr1 = fr2 = fr3 = fr4 = 0
+        fi = 0
+        for r in range(14, 1, -1):
+            if flush_mask & (1 << r):
+                if fi == 0: fr0 = r
+                elif fi == 1: fr1 = r
+                elif fi == 2: fr2 = r
+                elif fi == 3: fr3 = r
+                elif fi == 4: fr4 = r; break
+                fi += 1
+        return 5 * _B6 + fr0 * _B5 + fr1 * _B3 + fr2 * _B2 + fr3 * _B1 + fr4
+
+    # max_cnt はカードのデコードループで既に追跡済み（再計算不要）
 
     # ── フォーカード ──
     if max_cnt == 4:
@@ -251,9 +276,9 @@ def calculate_equity_fast(my_hand, board, num_opponents: int,
         rng = np.random.default_rng()
 
     # ── 全シミュレーション分を一括サンプリング ──
-    # random float 行列を argsort して置換サンプリング（numpy ネイティブ）
+    # argpartition で O(n_rem) per row（argsort の O(n_rem log n_rem) より高速）
     rand_vals = rng.random((num_simulations, n_rem))
-    perm_idx = np.argsort(rand_vals, axis=1)[:, :n_needed]
+    perm_idx = np.argpartition(rand_vals, n_needed, axis=1)[:, :n_needed]
     all_chosen = remaining[perm_idx]  # (num_simulations, n_needed) int32
 
     # ── 評価ループ（事前割り当てリストで list concat を回避）──

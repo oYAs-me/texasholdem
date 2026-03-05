@@ -8,9 +8,14 @@ Regret Matching ベースの簡易 Monte Carlo CFR 実装。
 from __future__ import annotations
 import json
 import os
+import tempfile
+import warnings
 from collections import defaultdict
 
 from gto_strategy import heuristic_strategy
+
+# JSONフォーマットのバージョン。状態キー形式が変わるたびに増やす
+_FORMAT_VERSION = 4
 
 
 class SimpleMCCFR:
@@ -48,15 +53,26 @@ class SimpleMCCFR:
         state_key: str,
         valid_actions: list[str],
         eq_bucket: int,
+        num_players: int = 2,
+        call_amount: int = 0,
+        pot: int = 1,
+        street: str = 'postflop',
+        hand_potential: str = 'na',
     ) -> dict[str, float]:
         """
         現在の混合戦略を返す。
         訪問回数が閾値未満のうちはヒューリスティックにフォールバック。
+        strategy_sum の蓄積は LEARN_THRESHOLD 到達後のみ（ヒューリスティック期間を除外）。
         """
         self.visit_count[state_key] += 1
 
         if self.visit_count[state_key] < self._LEARN_THRESHOLD:
-            return heuristic_strategy(eq_bucket, valid_actions)
+            return heuristic_strategy(
+                eq_bucket, valid_actions,
+                num_players=num_players, state_key=state_key,
+                call_amount=call_amount, pot=pot,
+                street=street, hand_potential=hand_potential,
+            )
 
         # Regret Matching: 正の後悔のみを使用して現在戦略を計算
         regrets = self.regret_sum[state_key]
@@ -66,9 +82,14 @@ class SimpleMCCFR:
         if total > 0:
             current_strategy = {a: positive[a] / total for a in valid_actions}
         else:
-            current_strategy = heuristic_strategy(eq_bucket, valid_actions)
+            current_strategy = heuristic_strategy(
+                eq_bucket, valid_actions,
+                num_players=num_players, state_key=state_key,
+                call_amount=call_amount, pot=pot,
+                street=street, hand_potential=hand_potential,
+            )
 
-        # 平均戦略の累積（収束後に average strategy を使えるようにする）
+        # 平均戦略の累積（LEARN_THRESHOLD 以降のみ: ヒューリスティック期間を含まない）
         for a in valid_actions:
             self.strategy_sum[state_key][a] += current_strategy[a]
 
@@ -105,18 +126,47 @@ class SimpleMCCFR:
             if self.regret_sum[state_key][action] < 0:
                 self.regret_sum[state_key][action] = 0.0
 
+    def update_strategy_sum(self, state_key: str, strategy: dict[str, float]) -> None:
+        """
+        strategy_sum を直接更新する（realtime resolve 等から呼ぶ用）。
+        LEARN_THRESHOLD 以降に達した状態のみ蓄積する。
+        """
+        if self.visit_count.get(state_key, 0) >= self._LEARN_THRESHOLD:
+            for a, prob in strategy.items():
+                self.strategy_sum[state_key][a] += prob
+
     # ──────────────────────────────────────────────
     # 永続化
     # ──────────────────────────────────────────────
 
     def save(self, path: str) -> None:
+        if path == os.devnull:
+            return
+
+        def _trim(d: dict) -> dict:
+            return {k: round(v, 3) for k, v in d.items()}
+
         data = {
-            'regret_sum': {k: dict(v) for k, v in self.regret_sum.items()},
-            'strategy_sum': {k: dict(v) for k, v in self.strategy_sum.items()},
-            'visit_count': dict(self.visit_count),
+            '_version': _FORMAT_VERSION,
+            'regret_sum':   {k: _trim(dict(v)) for k, v in self.regret_sum.items()},
+            'strategy_sum': {k: _trim(dict(v)) for k, v in self.strategy_sum.items()},
+            'visit_count':  dict(self.visit_count),
         }
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        dir_name = os.path.dirname(os.path.abspath(path))
+        try:
+            with tempfile.NamedTemporaryFile(
+                'w', dir=dir_name, suffix='.tmp', delete=False, encoding='utf-8'
+            ) as f:
+                tmp_path = f.name
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
 
     def load(self, path: str) -> None:
         if not os.path.exists(path):
@@ -124,11 +174,29 @@ class SimpleMCCFR:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+
+            file_version = data.get('_version', 0)
+            if file_version != _FORMAT_VERSION:
+                warnings.warn(
+                    f"gto_strategy.json のバージョンが異なります "
+                    f"(ファイル: v{file_version}, 現在: v{_FORMAT_VERSION})。"
+                    "学習データをリセットして新規開始します。",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return
+
             for k, v in data.get('regret_sum', {}).items():
                 self.regret_sum[k] = defaultdict(float, {ak: float(av) for ak, av in v.items()})
             for k, v in data.get('strategy_sum', {}).items():
                 self.strategy_sum[k] = defaultdict(float, {ak: float(av) for ak, av in v.items()})
             for k, v in data.get('visit_count', {}).items():
                 self.visit_count[k] = int(v)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            pass
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            warnings.warn(
+                f"gto_strategy.json の読み込みに失敗しました ({e})。"
+                "学習データをリセットして新規開始します。",
+                UserWarning,
+                stacklevel=2,
+            )
+

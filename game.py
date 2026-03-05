@@ -66,11 +66,23 @@ class Game:
         self._log(f"{Fore.YELLOW}{self.players[sb_pos].name}{Style.RESET_ALL} がSB {sb_amount} を支払いました。")
         self._log(f"{Fore.YELLOW}{self.players[bb_pos].name}{Style.RESET_ALL} がBB {bb_amount} を支払いました。")
 
+        self.deck = self._make_deck(contesting)
         for p in contesting:
             card1 = self.deck.pop()
             card2 = self.deck.pop()
             p.hand = Hand((card1, card2))
         return True
+
+    def _make_deck(self, contesting: list) -> list:
+        """デッキを生成してシャッフルする。サブクラスでオーバーライドすることで
+        特定ボードテクスチャへのバイアスが可能（gto_rare_training 用）。"""
+        deck = create_deck()
+        random.shuffle(deck)
+        return deck
+
+    def _all_in_run_out(self) -> bool:
+        """ベット可能なアクティブプレイヤーが1人以下ならTrue（残りカードはベットなしでdeal）。"""
+        return len([p for p in self.players if p.status == 'active']) <= 1
 
     def play_round(self):
         if not self.start_round(): return False
@@ -94,8 +106,8 @@ class Game:
         if not self.betting_round(start_idx):
             self.end_round_early()
             return True
-            
-        # 以降の各ストリート
+
+        # 以降の各ストリート（all-in状況ではベットをスキップしてカードだけ配る）
         streets = [("フロップ", 3), ("ターン", 1), ("リバー", 1)]
         for name, count in streets:
             self._log(f"\n{Fore.BLUE}[{name}]{Style.RESET_ALL}")
@@ -105,7 +117,10 @@ class Game:
             elif name == "リバー": self.board.set_river(cards[0])
             
             self._log(f"ボード: [{Player.hand_output_format(self.board.get_all_cards())}]")
-            
+
+            if self._all_in_run_out():
+                continue  # ベットをスキップして残りのカードも配る
+
             # ディーラーの次（SBの位置）から開始
             start_idx = (self.dealer_pos + 1) % len(self.players)
             while self.players[start_idx].status == 'busted':
@@ -152,14 +167,24 @@ class Game:
             p = self.players[current_idx]
             if p.status == 'active':
                 call_amount = round_max_bet - p.round_bet
+                # ── valid_actions の決定 ──
                 valid_actions = ['fold']
                 if call_amount == 0: valid_actions.append('check')
                 else: valid_actions.append('call')
-                if p.chips > call_amount: valid_actions.append('raise')
-                    
+                # 他にアクティブ（all-in でない）プレイヤーがいる場合のみ raise 可能
+                others_active = any(o.status == 'active' and o is not p for o in self.players)
+                if p.chips > call_amount and others_active: valid_actions.append('raise')
+
+                # 相手プレイヤーが出せる最大合計（レイズ上限の計算用）
+                max_raise_to = max(
+                    (o.chips + o.round_bet) for o in self.players
+                    if o.status in ('active', 'all-in') and o is not p
+                ) if others_active or any(o.status == 'all-in' for o in self.players if o is not p) else round_max_bet
+
                 game_state = {
                     'board': self.board, 'pot': self.pot, 'call_amount': call_amount,
                     'min_raise': round_max_bet + self.big_blind,
+                    'max_raise_to': max_raise_to,
                     'players': [{'name': p_o.name, 'chips': p_o.chips, 'status': p_o.status} for p_o in self.players],
                     'last_to_act_name': last_to_act_name,
                 }
@@ -182,12 +207,13 @@ class Game:
                     self.pot += pay_amt
                     self._log(f"[{name_fmt}] {Fore.BLUE}call{Style.RESET_ALL} (支払: {pay_amt})")
                 elif action == 'raise':
+                    old_round_max = round_max_bet
                     actual_raise_to = max(amount, round_max_bet + self.big_blind)
-                    increment = actual_raise_to - round_max_bet
                     pay_amt = p.pay(actual_raise_to - p.round_bet)
                     p.round_bet += pay_amt
                     self.pot += pay_amt
                     round_max_bet = p.round_bet
+                    increment = round_max_bet - old_round_max
                     last_raiser = current_idx
                     action_label = "bet" if call_amount == 0 else "raise"
                     self._log(f"[{name_fmt}] {Fore.YELLOW}{action_label:5}{Style.RESET_ALL} {round_max_bet} (+{increment})")

@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from gto_cpu import GtoCpu
 from gto_cfr import SimpleMCCFR
+from gto_cfr_utils import merge_cfr_data, apply_merged_data, load_base, save_merged, cfr_to_dict
 from gto_rare_training import run_rare_training
 from learning_game import LearningGame
 
@@ -66,85 +67,7 @@ def _run_chunk(args: tuple) -> dict:
             game.play_round()
 
     # 全プレイヤーの CFR データをマージして返す（対称的な自己対戦なので合算可能）
-    merged_regret:   dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    merged_strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    merged_visits:   dict[str, int] = defaultdict(int)
-    for p in players:
-        for k, v in p.cfr.regret_sum.items():
-            for a, val in v.items():
-                merged_regret[k][a] += val
-        for k, v in p.cfr.strategy_sum.items():
-            for a, val in v.items():
-                merged_strategy[k][a] += val
-        for k, val in p.cfr.visit_count.items():
-            merged_visits[k] += val
-    return {
-        "regret_sum":   {k: dict(v) for k, v in merged_regret.items()},
-        "strategy_sum": {k: dict(v) for k, v in merged_strategy.items()},
-        "visit_count":  dict(merged_visits),
-    }
-
-
-# ──────────────────────────────────────────────
-# CFR データのマージ
-# ──────────────────────────────────────────────
-
-def _merge_cfr_data(results: list[dict]) -> dict:
-    """
-    複数プロセスの CFR 結果を合算してマージする。
-    CFR は独立したシミュレーションの regret を足し合わせることで
-    等価な学習効果が得られる。
-    """
-    regret:   dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    visits:   dict[str, int] = defaultdict(int)
-
-    for result in results:
-        for state, actions in result["regret_sum"].items():
-            for action, value in actions.items():
-                regret[state][action] += value
-        for state, actions in result["strategy_sum"].items():
-            for action, value in actions.items():
-                strategy[state][action] += value
-        for state, count in result["visit_count"].items():
-            visits[state] += count
-
-    return {
-        "regret_sum":   {k: dict(v) for k, v in regret.items()},
-        "strategy_sum": {k: dict(v) for k, v in strategy.items()},
-        "visit_count":  dict(visits),
-    }
-
-
-def _apply_merged_data(cfr: SimpleMCCFR, data: dict) -> None:
-    """マージ済みデータを SimpleMCCFR インスタンスに書き込む"""
-    for k, v in data["regret_sum"].items():
-        cfr.regret_sum[k] = defaultdict(float, v)
-    for k, v in data["strategy_sum"].items():
-        cfr.strategy_sum[k] = defaultdict(float, v)
-    for k, v in data["visit_count"].items():
-        cfr.visit_count[k] = v
-
-
-def _load_base(save_path: str) -> dict:
-    """既存の学習データをマージ用の dict として読み込む"""
-    base_cfr = SimpleMCCFR()
-    base_cfr.load(save_path)
-    return {
-        "regret_sum":   {k: dict(v) for k, v in base_cfr.regret_sum.items()},
-        "strategy_sum": {k: dict(v) for k, v in base_cfr.strategy_sum.items()},
-        "visit_count":  dict(base_cfr.visit_count),
-    }
-
-
-def _save_merged(results: list[dict], save_path: str) -> int:
-    """マージして保存。学習済み状態数を返す"""
-    merged = _merge_cfr_data(results)
-    final_cfr = SimpleMCCFR()
-    _apply_merged_data(final_cfr, merged)
-    final_cfr.save(save_path)
-    return len(merged["visit_count"])
-
+    return merge_cfr_data([cfr_to_dict(p.cfr) for p in players])
 
 # ──────────────────────────────────────────────
 # メイン学習ループ
@@ -176,7 +99,7 @@ def run_selfplay(
         f" → {save_path}"
     )
 
-    base_data = _load_base(save_path)
+    base_data = load_base(save_path)
     all_results: list[dict] = [base_data]
     chunk_args = (_BATCH_HANDS_PER_WORKER, num_players, start_chips, num_simulations)
 
@@ -214,7 +137,7 @@ def run_selfplay(
                 pbar.set_postfix(states=num_states)
         finally:
             pbar.close()
-            num_states = _save_merged(all_results, save_path)
+            num_states = save_merged(all_results, save_path)
             print(f"[完了] {total_hands} ハンド / {num_states} 状態 → {save_path}")
         if run_rare:
             # selfplay 時間の 20%（最低 1 分）
@@ -253,7 +176,7 @@ def run_selfplay(
                         states=sum(len(r["visit_count"]) for r in all_results),
                     )
 
-    num_states = _save_merged(all_results, save_path)
+    num_states = save_merged(all_results, save_path)
     print(f"[完了] {num_states} 状態 → {save_path}")
 
     if run_rare:
@@ -304,8 +227,8 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--players", type=int, default=4, choices=range(2, 7), metavar="N",
-        help="テーブル人数 (2〜6)",
+        "--players", type=int, default=4, choices=range(2, 11), metavar="N",
+        help="テーブル人数 (2〜10)",
     )
     parser.add_argument(
         "--save", type=str, default="gto_strategy.json", metavar="PATH",

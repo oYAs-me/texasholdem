@@ -30,9 +30,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from card import Hand, Board, create_deck
+from card import Board, create_deck
 from gto_cpu import GtoCpu
 from gto_cfr import SimpleMCCFR
+from gto_cfr_utils import merge_cfr_data, load_base, save_merged, cfr_to_dict
 from gto_strategy import classify_board_texture
 from learning_game import LearningGame
 
@@ -48,9 +49,8 @@ class BiasedLearningGame(LearningGame):
     """
     ボードテクスチャを偏らせた LearningGame。
 
-    start_round() で target_textures に合致するデッキを
-    リジェクションサンプリングで生成する。
-    game.py の start_round をベースにデッキ生成部分だけ変更。
+    game.py の _make_deck() をオーバーライドして、target_textures に合致する
+    デッキをリジェクションサンプリングで生成する。
     """
 
     def __init__(
@@ -64,7 +64,7 @@ class BiasedLearningGame(LearningGame):
         super().__init__(players, start_chips=start_chips, sb=sb, bb=bb)
         self._target_textures: frozenset[str] = target_textures or frozenset()
 
-    def _make_biased_deck(self, num_contesting: int) -> list:
+    def _make_deck(self, contesting: list) -> list:
         """
         target_textures に合致するフロップが来るデッキを生成。
 
@@ -73,11 +73,9 @@ class BiasedLearningGame(LearningGame):
         最大 100 回試行し、合致しなければランダムデッキにフォールバック。
         """
         if not self._target_textures:
-            deck = create_deck()
-            random.shuffle(deck)
-            return deck
+            return super()._make_deck(contesting)
 
-        n = num_contesting * 2  # ホールカード分のオフセット
+        n = len(contesting) * 2  # ホールカード分のオフセット
         for _ in range(100):
             deck = create_deck()
             random.shuffle(deck)
@@ -91,46 +89,7 @@ class BiasedLearningGame(LearningGame):
                     return deck
 
         # フォールバック: ランダム
-        deck = create_deck()
-        random.shuffle(deck)
-        return deck
-
-    def start_round(self) -> bool:
-        """
-        game.py の start_round をほぼ踏襲し、デッキ生成部分のみ偏り付きに変更。
-        出力は selfplay 時に redirect_stdout で抑制されるため print 省略。
-        """
-        self.board = Board()
-        self.pot = 0
-        self.current_bet = 0
-
-        for p in self.players:
-            p.reset_for_new_round()
-
-        contesting = self.get_contesting_players()
-        if len(contesting) < 2:
-            return False
-
-        # ブラインド位置の決定
-        sb_pos = (self.dealer_pos + 1) % len(self.players)
-        while self.players[sb_pos].status == 'busted':
-            sb_pos = (sb_pos + 1) % len(self.players)
-        bb_pos = (sb_pos + 1) % len(self.players)
-        while self.players[bb_pos].status == 'busted':
-            bb_pos = (bb_pos + 1) % len(self.players)
-
-        # ブラインド支払い
-        sb_amount = self.players[sb_pos].pay(self.small_blind)
-        bb_amount = self.players[bb_pos].pay(self.big_blind)
-        self.pot += sb_amount + bb_amount
-        self.current_bet = self.big_blind
-
-        # ── 偏ったデッキを生成してホールカードをディール ──
-        self.deck = self._make_biased_deck(len(contesting))
-        for p in contesting:
-            p.hand = Hand((self.deck.pop(), self.deck.pop()))
-
-        return True
+        return super()._make_deck(contesting)
 
 
 # ──────────────────────────────────────────────
@@ -173,28 +132,16 @@ def _run_rare_chunk(args: tuple) -> dict:
             game.play_round()
 
     # レア状態 / 未学習状態のみをマージ
-    merged_regret:   dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    merged_strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    merged_visits:   dict[str, int] = defaultdict(int)
-
+    filtered_results = []
     for p in players:
-        for k, v in p.cfr.regret_sum.items():
-            if k not in known_common_states:
-                for a, val in v.items():
-                    merged_regret[k][a] += val
-        for k, v in p.cfr.strategy_sum.items():
-            if k not in known_common_states:
-                for a, val in v.items():
-                    merged_strategy[k][a] += val
-        for k, val in p.cfr.visit_count.items():
-            if k not in known_common_states:
-                merged_visits[k] += val
-
-    return {
-        "regret_sum":   {k: dict(v) for k, v in merged_regret.items()},
-        "strategy_sum": {k: dict(v) for k, v in merged_strategy.items()},
-        "visit_count":  dict(merged_visits),
-    }
+        d = cfr_to_dict(p.cfr)
+        filtered = {
+            "regret_sum":   {k: v for k, v in d["regret_sum"].items()   if k not in known_common_states},
+            "strategy_sum": {k: v for k, v in d["strategy_sum"].items() if k not in known_common_states},
+            "visit_count":  {k: v for k, v in d["visit_count"].items()  if k not in known_common_states},
+        }
+        filtered_results.append(filtered)
+    return merge_cfr_data(filtered_results)
 
 
 # ──────────────────────────────────────────────
@@ -237,56 +184,6 @@ def _analyze_rare_states(
     }
     return frozenset(known_common), target_textures, summary
 
-
-# ──────────────────────────────────────────────
-# CFR データのマージ / 保存（gto_selfplay.py と同じパターン）
-# ──────────────────────────────────────────────
-
-def _merge_cfr_data(results: list[dict]) -> dict:
-    regret:   dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    strategy: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    visits:   dict[str, int] = defaultdict(int)
-
-    for result in results:
-        for state, actions in result["regret_sum"].items():
-            for action, value in actions.items():
-                regret[state][action] += value
-        for state, actions in result["strategy_sum"].items():
-            for action, value in actions.items():
-                strategy[state][action] += value
-        for state, count in result["visit_count"].items():
-            visits[state] += count
-
-    return {
-        "regret_sum":   {k: dict(v) for k, v in regret.items()},
-        "strategy_sum": {k: dict(v) for k, v in strategy.items()},
-        "visit_count":  dict(visits),
-    }
-
-
-def _load_base(save_path: str) -> dict:
-    base_cfr = SimpleMCCFR()
-    base_cfr.load(save_path)
-    return {
-        "regret_sum":   {k: dict(v) for k, v in base_cfr.regret_sum.items()},
-        "strategy_sum": {k: dict(v) for k, v in base_cfr.strategy_sum.items()},
-        "visit_count":  dict(base_cfr.visit_count),
-    }
-
-
-def _save_merged(results: list[dict], save_path: str) -> int:
-    merged = _merge_cfr_data(results)
-    final_cfr = SimpleMCCFR()
-    for k, v in merged["regret_sum"].items():
-        final_cfr.regret_sum[k] = defaultdict(float, v)
-    for k, v in merged["strategy_sum"].items():
-        final_cfr.strategy_sum[k] = defaultdict(float, v)
-    for k, v in merged["visit_count"].items():
-        final_cfr.visit_count[k] = v
-    final_cfr.save(save_path)
-    return len(merged["visit_count"])
-
-
 # ──────────────────────────────────────────────
 # メイン学習ループ
 # ──────────────────────────────────────────────
@@ -320,7 +217,7 @@ def run_rare_training(
         f" → {save_path}"
     )
 
-    base_data = _load_base(save_path)
+    base_data = load_base(save_path)
     all_results: list[dict] = [base_data]
     chunk_args = (
         _BATCH_HANDS_PER_WORKER,
@@ -357,7 +254,7 @@ def run_rare_training(
             pbar.set_postfix(rare_updated=rare_updated)
     finally:
         pbar.close()
-        num_states = _save_merged(all_results, save_path)
+        num_states = save_merged(all_results, save_path)
         print(f"[完了] 学習完了: {total_hands} ハンド / {num_states} 状態 → {save_path}")
 
 
@@ -379,8 +276,8 @@ def main() -> None:
         help="visit_count がこの値未満の状態をレアとみなす",
     )
     parser.add_argument(
-        "--players", type=int, default=4, choices=range(2, 7), metavar="N",
-        help="テーブル人数 (2〜6)",
+        "--players", type=int, default=4, choices=range(2, 11), metavar="N",
+        help="テーブル人数 (2〜10)",
     )
     parser.add_argument(
         "--save", type=str, default="gto_strategy.json", metavar="PATH",

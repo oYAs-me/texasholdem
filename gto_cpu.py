@@ -18,7 +18,10 @@ from typing import Any
 from player import CpuAgent
 from card import Board
 from fast_eval import calculate_equity_fast
-from gto_strategy import build_state_key, get_equity_bucket, get_street, heuristic_strategy
+from gto_strategy import (
+    build_state_key, get_equity_bucket, get_street, heuristic_strategy,
+    get_hand_potential, compute_action_values,
+)
 from gto_cfr import SimpleMCCFR
 from hand_strength import evaluate_hand
 import numpy as np
@@ -108,6 +111,7 @@ class GtoCpu(CpuAgent):
         pot: int = game_state['pot']
         board: Board = game_state['board']
         min_raise: int = game_state.get('min_raise', call_amount * 2)
+        max_raise_to: int = game_state.get('max_raise_to', self.chips + self.current_bet)
 
         num_opponents = len([
             p for p in game_state['players']
@@ -128,8 +132,8 @@ class GtoCpu(CpuAgent):
 
         # ── ハンド・ポテンシャル詳細分類 ──
         hand_potential = 'na'
+        street = get_street(board)
         if self.hand is not None:
-            from gto_strategy import get_hand_potential
             ev = evaluate_hand(self.hand, board)
             hand_potential = get_hand_potential(ev.hand_type, self.hand, board)
 
@@ -137,6 +141,7 @@ class GtoCpu(CpuAgent):
             equity, board, call_amount, pot, num_opponents,
             is_last_to_act=is_last_to_act, chips=self.chips,
             hand_potential=hand_potential,
+            my_round_bet=getattr(self, 'round_bet', 0),
         )
 
         # ── CFR 用アクション空間: 'raise' をサイズ別に展開 ──
@@ -144,10 +149,18 @@ class GtoCpu(CpuAgent):
 
         # ── リアルタイム再解決: 現在局面に特化した高速ロールアウトで regret を補強 ──
         if self._n_realtime > 0:
-            self._realtime_resolve(state_key, cfr_actions, eq_bucket, equity, call_amount, pot)
+            self._realtime_resolve(
+                state_key, cfr_actions, eq_bucket, equity, call_amount, pot,
+                street=street, hand_potential=hand_potential,
+            )
 
         # ── 混合戦略を取得（CFR or ヒューリスティック）──
-        strategy = self.cfr.get_strategy(state_key, cfr_actions, eq_bucket)
+        strategy = self.cfr.get_strategy(
+            state_key, cfr_actions, eq_bucket,
+            num_players=num_opponents + 1,
+            call_amount=call_amount, pot=pot,
+            street=street, hand_potential=hand_potential,
+        )
 
         # チェック可能な状況でのフォールドは支配戦略（常にcheckの方が優位）
         if 'check' in cfr_actions and strategy.get('fold', 0.0) > 0.0:
@@ -156,10 +169,32 @@ class GtoCpu(CpuAgent):
             if total > 0:
                 strategy = {a: v / total for a, v in strategy.items()}
 
+        # ── fold が明らかに非合理なケースを強制排除 ──
+        if call_amount > 0 and 'fold' in strategy:
+            pot_odds = call_amount / (pot + call_amount)
+            # オールインに近い（コール額 >= 自チップの 60%）かつ +EV
+            is_near_allin = (call_amount >= self.chips * 0.6 and equity > 0.25)
+            # ポットオッズよりエクイティが 10pt 以上高い（コールが明確に +EV）
+            is_clear_call = (equity > pot_odds + 0.10)
+            if is_near_allin or is_clear_call:
+                strategy['fold'] = 0.0
+                total = sum(strategy.values())
+                if total > 0:
+                    strategy = {a: v / total for a, v in strategy.items()}
+                else:
+                    # 全アクションが 0 になった場合: fold 以外を均等に配分
+                    non_fold = [a for a in strategy if a != 'fold']
+                    if non_fold:
+                        w = 1.0 / len(non_fold)
+                        strategy = {a: (w if a != 'fold' else 0.0) for a in strategy}
+                    # else: fold しか選択肢がない（そのままにする）
+
         # ── 確率的にアクションを選択（GTOの核心）──
-        cfr_action = random.choices(
-            list(strategy.keys()), weights=list(strategy.values())
-        )[0]
+        # ウェイト合計が 0 の場合（理論上は起きないが念のため）は均等分配にフォールバック
+        weights = list(strategy.values())
+        if sum(weights) <= 0:
+            weights = [1.0] * len(weights)
+        cfr_action = random.choices(list(strategy.keys()), weights=weights)[0]
 
         # ── game.py 用に逆変換・ベットサイズ計算 ──
         amount = 0
@@ -168,6 +203,8 @@ class GtoCpu(CpuAgent):
             game_action = 'call'
         elif cfr_action in _RAISE_RATIOS:
             amount = _compute_raise_amount(cfr_action, pot, min_raise)
+            # 相手が出せる最大額を超えないよう上限を設定（無駄なオーバーレイズ防止）
+            amount = min(amount, max_raise_to)
             game_action = 'raise'
         else:
             game_action = cfr_action  # 'fold' or 'check'
@@ -180,6 +217,9 @@ class GtoCpu(CpuAgent):
             'action': cfr_action,
             'call_amount': call_amount,
             'pot': pot,
+            'equity': equity,
+            'street': street,
+            'hand_potential': hand_potential,
         })
 
         return game_action, amount
@@ -196,18 +236,12 @@ class GtoCpu(CpuAgent):
         equity: float,
         call_amount: int,
         pot: int,
+        street: str = 'postflop',
+        hand_potential: str = 'na',
     ) -> None:
         """
-        現在局面に特化した高速ロールアウトで regret_sum を補強する。
-
-        すでに計算済みの equity を確率的勝敗のシードとして使い、
-        追加 Monte Carlo コストなしで n_realtime 回の反実仮想更新を実行。
-        visit_count は変更しないため selfplay ログには影響しない。
+        現在局面に特化した高速ロールアウトで regret_sum / strategy_sum を補強する。
         """
-        can_check = 'check' in cfr_actions
-        total_pot = pot + call_amount
-        fold_fraction = call_amount / total_pot if total_pot > 0 else 0.3
-
         for _ in range(self._n_realtime):
             # 現在の後悔から現時点の戦略を計算（visit_count を触らない）
             regrets = self.cfr.regret_sum.get(state_key, {})
@@ -216,7 +250,11 @@ class GtoCpu(CpuAgent):
             if total_r > 0:
                 strategy = {a: positive[a] / total_r for a in cfr_actions}
             else:
-                strategy = heuristic_strategy(eq_bucket, cfr_actions)
+                strategy = heuristic_strategy(
+                    eq_bucket, cfr_actions,
+                    call_amount=call_amount, pot=pot,
+                    street=street, hand_potential=hand_potential,
+                )
 
             # エクイティに基づく確率的ロールアウト
             won = random.random() < equity
@@ -227,19 +265,14 @@ class GtoCpu(CpuAgent):
                 list(strategy.keys()), weights=list(strategy.values())
             )[0]
 
-            # 各アクションの反実仮想価値を推定
-            action_values: dict[str, float] = {}
-            for a in cfr_actions:
-                if a == taken:
-                    action_values[a] = reward
-                elif a == 'fold':
-                    # check があれば fold は常に非合理（同じ損失）
-                    action_values[a] = reward if can_check else reward * fold_fraction
-                else:
-                    # 他のアクション（call/raise系）は現在の報酬の控えめな推定
-                    action_values[a] = reward * 0.8
+            action_values = compute_action_values(
+                reward, equity, taken, cfr_actions,
+                call_amount, pot, street=street, hand_potential=hand_potential,
+            )
 
             self.cfr.update_regret(state_key, taken, action_values)
+            # realtime resolve の学習も平均戦略に反映する
+            self.cfr.update_strategy_sum(state_key, strategy)
 
     # ──────────────────────────────────────────────
     # CFR 学習フック（オプション）
@@ -261,28 +294,17 @@ class GtoCpu(CpuAgent):
             state_key = record['state_key']
             strategy = record['strategy']
             taken = record['action']
-
-            # 反実仮想価値: 各アクションを「代わりに取った場合」の推定値
-            can_check = 'check' in strategy
+            equity_rec: float = record.get('equity', 0.5)
             call_amount_rec: int = record.get('call_amount', 0)
             pot_rec: int = record.get('pot', 1)
-            action_values: dict[str, float] = {}
-            for a, prob in strategy.items():
-                if a == taken:
-                    action_values[a] = reward
-                elif a == 'fold':
-                    if can_check:
-                        # check可能な状況でのfoldは支配戦略 → 後悔を蓄積させない
-                        action_values[a] = reward
-                    else:
-                        # フォールドの価値: コール額がポット全体に占める比率で割引
-                        # (コール額が小さいほどfoldはほぼ中立、大きいほど損失が大きい)
-                        total = pot_rec + call_amount_rec
-                        fold_fraction = call_amount_rec / total if total > 0 else 0.3
-                        action_values[a] = reward * fold_fraction
-                else:
-                    # call / raise は現在の報酬を 80% で割り引いた推定
-                    action_values[a] = reward * 0.8
+            street_rec: str = record.get('street', 'postflop')
+            hand_pot_rec: str = record.get('hand_potential', 'na')
+
+            action_values = compute_action_values(
+                reward, equity_rec, taken, list(strategy.keys()),
+                call_amount_rec, pot_rec,
+                street=street_rec, hand_potential=hand_pot_rec,
+            )
 
             self.cfr.update_regret(state_key, taken, action_values)
 
