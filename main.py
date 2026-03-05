@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from player import HumanPlayer, ConservativeCpu, BalancedCpu, AggressiveCpu
 from gto_cpu import GtoCpu
+from bayesian_cpu import BayesianCpu
 from learning_game import LearningGame as Game
 
 # Windows の cp932 ではスーツ記号が表示できないため UTF-8 に設定する
@@ -23,9 +24,10 @@ def _make_cpu_players(num_players, initial_chips, num_simulations):
         BalancedCpu("Balanced-1",      chips=initial_chips),
         BalancedCpu("Balanced-2",      chips=initial_chips),
         AggressiveCpu("Aggressive",    chips=initial_chips),
-        GtoCpu("GTO-CPU",             chips=initial_chips, num_simulations=num_simulations),
+        # GtoCpu("GTO-CPU",             chips=initial_chips, num_simulations=num_simulations),
+        BayesianCpu("Bayesian",        chips=initial_chips),
     ]
-    extra = [BalancedCpu(f"Balanced-{j+3}", chips=initial_chips) for j in range(max(0, num_players - 5))]
+    extra = [BalancedCpu(f"Balanced-{j+3}", chips=initial_chips) for j in range(max(0, num_players - len(pool)))]
     return (pool + extra)[:num_players]
 
 

@@ -217,7 +217,12 @@ class Game:
                     last_raiser = current_idx
                     action_label = "bet" if call_amount == 0 else "raise"
                     self._log(f"[{name_fmt}] {Fore.YELLOW}{action_label:5}{Style.RESET_ALL} {round_max_bet} (+{increment})")
-            
+
+                # アクション後に観察者へ通知（on_opponent_action を持つプレイヤー）
+                for obs in self.players:
+                    if obs is not p and obs.status not in ('folded', 'busted') and hasattr(obs, 'on_opponent_action'):
+                        obs.on_opponent_action(p.name, action, amount, game_state)
+
             if len(self.get_contesting_players()) == 1: return False
             next_idx = (current_idx + 1) % len(self.players)
             
@@ -260,6 +265,13 @@ class Game:
                 best_str = Player.hand_output_format(ev_hand.best_cards)
                 self._log(f"{Fore.CYAN}{p.name:^7}{Style.RESET_ALL}: [{h_str}]")
                 self._log(f"  -> {Fore.MAGENTA}{ev_hand.hand_type:15}{Style.RESET_ALL} [{best_str}]")
+
+        # ショーダウン手牌を観察者へ通知（on_showdown_hand を持つプレイヤー）
+        for p in contesting:
+            if p.hand:
+                for observer in self.players:
+                    if observer is not p and hasattr(observer, 'on_showdown_hand'):
+                        observer.on_showdown_hand(p.name, p.hand)
 
         # 役の強さでソート
         evaluated_hands.sort(key=lambda x: x['ev'].value, reverse=True)
